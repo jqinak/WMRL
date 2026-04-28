@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lewm"
+version = "0.1.0"
+description = "Local LE-WM package for WMRL integration"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "einops",
+]
+
+[tool.setuptools]
+packages = ["lewm"]
+
+[tool.setuptools.package-dir]
+lewm = "."
