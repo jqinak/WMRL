@@ -1,10 +1,18 @@
-checkpoint: /project/peilab/qjl/2026/wmrl/playground/wm/lewm_weights.ckpt
+checkpoint: /project/peilab/qjl/2026/wmrl/playground/wm/last.ckpt
 output_dir: /project/peilab/qjl/2026/wmrl/lewm/eval/eval_outputs/libero_embed_eval
 device: cuda
 encode_chunk_t: 64
 n_step_max: 10
-max_episodes: null
+n_step_list:
+- 1
+- 10
+- 50
+- 100
+eval_task1: true
+eval_task2: true
+max_episodes: 30
 max_starts_per_episode: null
+progress_every_episode: true
 seed: 3072
 img_size: 224
 patch_size: 14
@@ -25,7 +33,7 @@ data:
   dataset:
     type: libero
     root: /project/peilab/qjl/2026/playground/dataset/libero
-    split: val
+    split: train
     num_steps: 4
     frameskip: 1
     keys_to_load:
