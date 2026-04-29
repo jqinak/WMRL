@@ -1,0 +1,72 @@
+defaults:
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+checkpoint: /project/peilab/qjl/2026/wmrl/playground/wm/lewm_weights.ckpt
+output_dir: ./eval_outputs/libero_embed_eval
+device: cuda
+
+# encode long episodes in chunks of this many timesteps (GPU memory)
+encode_chunk_t: 64
+
+# Task 2: max n-step horizon — 仅在 n_step_list 为 null 时用于生成 1..n_step_max；显式给出 n_step_list 时以此为准
+n_step_max: 10
+# Task 2 开环长度列表（null 则用 1 到 n_step_max）；可改为 [1, 5, 10] 等
+n_step_list: null
+
+# 评测开关：可与 run_eval_libero.sh 中 EVAL_TASKS 同时使用
+eval_task1: true
+eval_task2: true
+
+# optional subsampling
+max_episodes: null
+max_starts_per_episode: null
+# 每跑完一个 episode 在 stdout 打一行（full_episode 当条 + 截至当前的 full 均值）
+progress_every_episode: true
+seed: 3072
+
+img_size: 224
+patch_size: 14
+encoder_scale: tiny
+
+wm:
+  type: lewm
+  history_size: 3
+  num_preds: 1
+  embed_dim: 192
+  # action_dim set at runtime from dataset (same as train.py)
+
+predictor:
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+data:
+  dataset:
+    type: libero
+    root: /project/peilab/qjl/2026/playground/dataset/libero
+    split: val
+    num_steps: 4
+    frameskip: 1
+    keys_to_load:
+      - pixels
+      - action
+      - state
+    pixel_key: image
+    max_episode_cache: 8
+
+wandb:
+  enabled: true
+  project: lewm_eval
+  entity: null
+  name: libero_embed_eval
+  tags:
+    - lewm
+    - libero

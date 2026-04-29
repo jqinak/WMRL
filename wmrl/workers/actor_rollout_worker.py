@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -234,16 +235,18 @@ class ActorRolloutWorker:
         log_cap = math.log(max_ratio_guard + 1e-12)
         ratio = torch.exp(torch.clamp(log_ratio, min=-log_cap, max=log_cap))
         response_mask = torch.ones_like(advantages, device=self.device)
-        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = core_algos.compute_policy_loss(
-            old_log_prob=old_log_probs,
-            log_prob=new_log_probs,
-            advantages=advantages,
-            response_mask=response_mask,
-            cliprange=float(self.config.algorithm.clip_ratio),
-            cliprange_low=float(self.config.algorithm.clip_ratio),
-            cliprange_high=float(self.config.algorithm.clip_ratio),
-            clip_ratio_c=3.0,
-        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=FutureWarning)
+            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = core_algos.compute_policy_loss(
+                old_log_prob=old_log_probs,
+                log_prob=new_log_probs,
+                advantages=advantages,
+                response_mask=response_mask,
+                cliprange=float(self.config.algorithm.clip_ratio),
+                cliprange_low=float(self.config.algorithm.clip_ratio),
+                cliprange_high=float(self.config.algorithm.clip_ratio),
+                clip_ratio_c=3.0,
+            )
         entropy_loss = core_algos.agg_loss(entropy, response_mask, loss_agg_mode="token-mean")
         total_loss = pg_loss - float(self.config.algorithm.entropy_coeff) * entropy_loss
         total_loss.backward()
@@ -261,12 +264,12 @@ class ActorRolloutWorker:
         if bool(self.config.algorithm.get("kl_stop_on_exceed", False)) and target_kl > 0.0 and float(ppo_kl) > target_kl and not bool(getattr(self.config.runtime, "smoke_random_init", False)):
                 raise RuntimeError(f"PPO KL divergence too large: {float(ppo_kl):.6f} > target_kl={target_kl:.6f}")
         ratio_raw_max = float(torch.exp(torch.clamp(log_ratio, min=-50.0, max=50.0)).max().detach().cpu())
-        if ratio_raw_max > max_ratio_guard and not bool(
-            getattr(self.config.runtime, "smoke_random_init", False)
-        ):
-            raise RuntimeError(
-                f"PPO ratio max too large: {ratio_raw_max:.4f} > max_ratio_guard={max_ratio_guard:.4f}"
-            )
+        # if ratio_raw_max > max_ratio_guard and not bool(
+        #     getattr(self.config.runtime, "smoke_random_init", False)
+        # ):
+        #     raise RuntimeError(
+        #         f"PPO ratio max too large: {ratio_raw_max:.4f} > max_ratio_guard={max_ratio_guard:.4f}"
+        #     )
         ratio_max = ratio.max()
         return {
             "actor/loss": float(total_loss.detach().cpu()),

@@ -13,7 +13,7 @@ from wmrl.workers.tokenizer_bridge import TokenizerBridge
 
 
 class LewmRewardWorker:
-    """LE-WM 奖励 worker：输出 token 级稠密奖励。"""
+    """LE-WM 奖励 worker：默认 pred_vs_gt_pixel — predictor(像素上下文+预测动作) 与 GT 像素 encoder 表征的余弦相似度。"""
 
     def __init__(self, config):
         self.config = config
@@ -45,19 +45,23 @@ class LewmRewardWorker:
         ckpt_path = Path(self.config.paths.lewm_ckpt)
         if not ckpt_path.exists():
             if self.use_fallback:
+                print(f"[LEWM] checkpoint missing, using fallback: {ckpt_path}")
                 return
             raise FileNotFoundError(f"LE-WM checkpoint not found: {ckpt_path}")
 
         try:
-            ckpt = torch.load(ckpt_path, map_location="cpu")
-        except Exception:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        except Exception as e:
+            print(f"[LEWM] torch.load failed ({ckpt_path}): {e}")
             ckpt = None
 
         if isinstance(ckpt, torch.nn.Module):
             self.model = ckpt.to(self.device).eval()
+            print(f"[LEWM] loaded full nn.Module from {ckpt_path}")
             return
-        if hasattr(ckpt, "encode") and hasattr(ckpt, "predict"):
+        if ckpt is not None and hasattr(ckpt, "encode") and hasattr(ckpt, "predict"):
             self.model = ckpt.to(self.device).eval()
+            print(f"[LEWM] loaded object with encode/predict from {ckpt_path}")
             return
 
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
@@ -69,24 +73,29 @@ class LewmRewardWorker:
                         filtered[k[len("model.") :]] = v
                 self._load_state_dict_checked(self.model, filtered)
                 self.model.to(self.device).eval()
+                print(f"[LEWM] loaded state_dict (model.* keys) from {ckpt_path}, params matched checked.")
                 return
-            except Exception:
+            except Exception as e:
                 self.model = None
+                print(f"[LEWM] state_dict branch failed: {e}")
 
-        if isinstance(ckpt, dict) and any(k.startswith("encoder.") for k in ckpt.keys()):
+        if isinstance(ckpt, dict) and any(str(k).startswith("encoder.") for k in ckpt.keys()):
             try:
                 self.model = self._build_jepa_from_config()
                 self._load_state_dict_checked(self.model, ckpt)
                 self.model.to(self.device).eval()
+                print(f"[LEWM] loaded flat encoder.* state_dict from {ckpt_path}")
                 return
-            except Exception:
+            except Exception as e:
                 self.model = None
+                print(f"[LEWM] encoder.* branch failed: {e}")
 
         if not self.use_fallback:
             raise RuntimeError(
                 "Failed to load LE-WM checkpoint in supported formats. "
                 "Set reward.fallback_to_action_embedding=true to allow fallback."
             )
+        print("[LEWM] all load branches failed; using fallback reward (cosine actions).")
 
     def _load_state_dict_checked(self, model: torch.nn.Module, state_dict: dict[str, torch.Tensor]):
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -202,12 +211,27 @@ class LewmRewardWorker:
                 seq_len = int(self.history_size + self.num_preds)
                 pixels = self._extract_pixels_sequence(examples, seq_len=seq_len)
                 pred_seq = self._prepare_action_sequence(pred_actions.to(self.device), seq_len=seq_len)
-                gt_seq = self._prepare_action_sequence(gt_actions.to(self.device), seq_len=seq_len)
-                real_info = {"pixels": pixels, "action": gt_seq}
-                real_info = self.model.encode(real_info)
-                emb_real = real_info["emb"]
-                ctx_emb = emb_real[:, : self.history_size]
-                tgt_emb = emb_real[:, self.num_preds :]
+                mode = str(self.config.reward.get("lewm_compare_mode", "pred_vs_gt_pixel")).lower()
+
+                # 默认 pred_vs_gt_pixel：GT 像素序列仅过 encode(+projector) 得 emb_gt（表征与动作无关）。
+                # 预测侧：历史 ctx_emb + 预测动作经 action_encoder 再经 predictor 得 pred_emb。
+                # 奖励：cos(pred_emb, tgt_emb)，tgt_emb 为 GT 像素在对应时间片的 encoder 表征。
+                if mode == "pred_vs_gt_pixel":
+                    emb_info = self.model.encode({"pixels": pixels})
+                    print(f"pred_vs_gt_pixel: pixels shape: {pixels.shape}")
+                    emb_gt = emb_info["emb"]
+                elif mode == "joint_encode_gt_action":
+                    gt_seq = self._prepare_action_sequence(gt_actions.to(self.device), seq_len=seq_len)
+                    emb_info = self.model.encode({"pixels": pixels, "action": gt_seq})
+                    emb_gt = emb_info["emb"]
+                else:
+                    raise ValueError(
+                        f"Unsupported reward.lewm_compare_mode: {mode!r} "
+                        "(use 'pred_vs_gt_pixel' or 'joint_encode_gt_action')."
+                    )
+
+                ctx_emb = emb_gt[:, : self.history_size]
+                tgt_emb = emb_gt[:, self.num_preds :]
                 pred_act_emb = self.model.action_encoder(pred_seq[:, : self.history_size])
                 pred_emb = self.model.predict(ctx_emb, pred_act_emb)
                 return F.cosine_similarity(pred_emb, tgt_emb, dim=-1)
@@ -215,6 +239,20 @@ class LewmRewardWorker:
         if not self.use_fallback:
             raise RuntimeError("LE-WM model unavailable and fallback disabled.")
         return F.cosine_similarity(pred_actions.to(self.device), gt_actions.to(self.device), dim=-1)
+
+    @staticmethod
+    def _align_step_reward_to_horizon(step_reward: torch.Tensor, horizon: int) -> torch.Tensor:
+        """将 LEWM 相似度 [B, T_wm] 与策略 rollout 步数 horizon 对齐（fallback 路径已为 [B, horizon]）。"""
+        if step_reward.dim() != 2:
+            raise ValueError(f"step_reward must be 2D, got shape={tuple(step_reward.shape)}")
+        b, t = step_reward.shape
+        if t == horizon:
+            return step_reward
+        if t == 1:
+            return step_reward.expand(b, horizon)
+        x = step_reward.unsqueeze(1).float()
+        x = F.interpolate(x, size=horizon, mode="linear", align_corners=False)
+        return x.squeeze(1).to(step_reward.dtype)
 
     def _aggregate(self, step_reward: torch.Tensor) -> torch.Tensor:
         mode = str(self.config.reward.aggregate).lower()
@@ -235,6 +273,14 @@ class LewmRewardWorker:
         horizon = pred.shape[1]
         gt = self.bridge.extract_actions(examples, self.device, horizon=horizon).to(self.device)
         step_reward = self._compute_step_similarity(examples, pred, gt)
+        step_reward = self._align_step_reward_to_horizon(step_reward, horizon)
+        # 归一化前统计：用于日志观察「真实相似度/回报」是否随训练上升（normalize 后 reward_mean≈0 无信息量）
+        sample_reward_raw = self._aggregate(step_reward)
+        reward_mean_raw = float(sample_reward_raw.mean().detach().cpu())
+        reward_std_raw = float(sample_reward_raw.std(unbiased=False).detach().cpu())
+        step_reward_mean_raw = float(step_reward.mean().detach().cpu())
+        step_reward_std_raw = float(step_reward.std(unbiased=False).detach().cpu())
+
         if bool(self.config.reward.normalize):
             step_reward = (step_reward - step_reward.mean()) / (step_reward.std(unbiased=False) + 1e-6)
 
@@ -254,4 +300,8 @@ class LewmRewardWorker:
             "reward_std": float(sample_reward.std(unbiased=False).detach().cpu()),
             "step_reward_mean": float(step_reward.mean().detach().cpu()),
             "step_reward_std": float(step_reward.std(unbiased=False).detach().cpu()),
+            "reward_mean_raw": reward_mean_raw,
+            "reward_std_raw": reward_std_raw,
+            "step_reward_mean_raw": step_reward_mean_raw,
+            "step_reward_std_raw": step_reward_std_raw,
         }

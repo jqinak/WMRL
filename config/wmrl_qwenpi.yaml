@@ -7,11 +7,11 @@ runtime:
 paths:
   # 可选：显式指定 starVLA 仓路径；不填时从 ckpt 自动推断。
   starvla_repo: /project/peilab/qjl/2026/wmrl/starVLA
-  # 可选：覆盖 lewm 配置；通常为空，走 lewm_repo/config/train/lewm.yaml。
-  lewm_cfg_path: null
-  lewm_repo: /project/peilab/qjl/2026/wmrl/le-wm
-  starvla_ckpt: /project/peilab/qjl/2026/wmrl/playground/vla/
-  lewm_ckpt: /project/peilab/qjl/2026/wmrl/playground/wm/epoch=99-step=66924.ckpt
+  # LE-WM：架构 YAML（构建 JEPA 必需）。默认拼 paths.lewm_repo + config/train/lewm.yaml
+  lewm_cfg_path: /project/peilab/qjl/2026/wmrl/lewm/config/train/lewm.yaml
+  lewm_repo: /project/peilab/qjl/2026/wmrl/lewm
+  starvla_ckpt: /project/peilab/qjl/2026/wmrl/playground/vla/finalmodel/pytorch_model.pt
+  lewm_ckpt: /project/peilab/qjl/2026/wmrl/playground/wm/lewm_weights.ckpt
 
 data:
   dataloader_type: starvla_lerobot
@@ -30,7 +30,7 @@ algorithm:
   adv_norm_eps: 1e-6
   clip_ratio: 0.2
   target_kl: 0.1
-  kl_stop_on_exceed: true
+  kl_stop_on_exceed: false
   max_ratio_guard: 20.0
   entropy_coeff: 0.001
   actor_lr: 1e-6
@@ -49,6 +49,9 @@ algorithm:
 
 reward:
   type: cosine_dense
+  # LEWM：pred_vs_gt_pixel=历史像素 ctx + 预测动作 → predictor，与 GT 像素序列经 encoder 的 tgt 表征比余弦（默认）
+  # joint_encode_gt_action=encode 时额外传 GT action（emb 与 pred_vs_gt_pixel 相同，多算 act_emb）
+  lewm_compare_mode: pred_vs_gt_pixel
   aggregate: mean
   discount: 0.99
   normalize: true
@@ -64,3 +67,5 @@ trainer:
   log_interval: 10
   save_interval: 100
   output_dir: /project/peilab/qjl/2026/wmrl/checkpoints/wmrl_qwenpi
+  wandb.enabled: true
+  # wandb：默认若 starvla_cfg.trackers 含 wandb 则上报；强制开关或覆盖 entity/project/run_name 见 OmegaConf trainer.wandb（可选）

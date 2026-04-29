@@ -1,9 +1,10 @@
 run_id: starvla
 run_root_dir: playground/Checkpoints
 seed: 42
+# WMRL（main_wmrl_qwenpi）会在 ray_wmrl_trainer 中读取 trackers / wandb_*；trackers 含 wandb 时自动 wandb.init
 trackers: [jsonl, wandb]
-wandb_entity: your_wandb_entity
-wandb_project: llavavla
+wandb_entity: jqinak-hkust
+wandb_project: qwenPI_rl_debug
 is_debug: false
 
 
