@@ -6,9 +6,12 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from omegaconf import OmegaConf
 from PIL import Image
 
 from lewm import ARPredictor, Embedder, JEPA, MLP
+
+from wmrl.workers.lewm_rollout_micro import pil_batch_to_pixels_btc, predict_micro_emb_sequence_open_loop
 from wmrl.workers.tokenizer_bridge import TokenizerBridge
 
 
@@ -218,7 +221,6 @@ class LewmRewardWorker:
                 # 奖励：cos(pred_emb, tgt_emb)，tgt_emb 为 GT 像素在对应时间片的 encoder 表征。
                 if mode == "pred_vs_gt_pixel":
                     emb_info = self.model.encode({"pixels": pixels})
-                    print(f"pred_vs_gt_pixel: pixels shape: {pixels.shape}")
                     emb_gt = emb_info["emb"]
                 elif mode == "joint_encode_gt_action":
                     gt_seq = self._prepare_action_sequence(gt_actions.to(self.device), seq_len=seq_len)
@@ -305,3 +307,177 @@ class LewmRewardWorker:
             "step_reward_mean_raw": step_reward_mean_raw,
             "step_reward_std_raw": step_reward_std_raw,
         }
+
+    def compute_trajectory_lewm_rewards(
+        self,
+        first_obs_pils: list,
+        expert_views_per_traj: list[list],
+        predicted_micro_actions: torch.Tensor,
+        *,
+        gt_micro_actions: torch.Tensor | None,
+        chunk_actions: int,
+    ) -> dict[str, Any]:
+        """Trajectory LEWM rewards: optional sparse chunk-end milestones, optional dense milestones, optional terminal bonus.
+
+        Enable flags: ``reward.trajectory.enable_trajectory_*`` / legacy ``chunk_end_milestone_only`` when both omit.
+        Sparse = credit only chunk-end ``k``. Dense = credit every ``k``. Both can stack.
+        Dense requires ``trajectory_rollout.gt_use_next_observation=true``.
+        GT per ``pred_emb[k]``: ``start+k+1`` vs ``start+k`` per ``gt_use_next_observation``.
+        """
+        del first_obs_pils  # LEWM rollout uses encoder only on trajectory first frame internally (from expert_views)
+
+        traj_cfg = OmegaConf.select(self.config, "reward.trajectory") or OmegaConf.create({})
+        sparse_ms = float(traj_cfg.get("sparse_milestone_scale", traj_cfg.get("milestone_scale", 1.0)))
+        dense_ms = float(traj_cfg.get("dense_milestone_scale", traj_cfg.get("milestone_scale", 1.0)))
+        term_bonus = float(traj_cfg.get("terminal_bonus", 0.5))
+        thresh = float(traj_cfg.get("terminal_cos_threshold", 0.85))
+        denom_mode = str(traj_cfg.get("credit_denom_mode", "chunk_tokens")).lower()
+        fallback_pair = bool(traj_cfg.get("fallback_pair_pred_gt_action", False))
+
+        traj_roll_cfg = OmegaConf.select(self.config, "trajectory_rollout") or OmegaConf.create({})
+        use_next_gt_obs = bool(traj_roll_cfg.get("gt_use_next_observation", True))
+
+        es = traj_cfg.get("enable_trajectory_sparse_milestone", None)
+        ed = traj_cfg.get("enable_trajectory_dense_milestone", None)
+        if es is None and ed is None:
+            ceo = bool(traj_cfg.get("chunk_end_milestone_only", True))
+            sparse_enabled = bool(ceo)
+            dense_enabled = not bool(ceo)
+        else:
+            sparse_enabled = bool(es) if es is not None else False
+            dense_enabled = bool(ed) if ed is not None else False
+
+        eterm = traj_cfg.get("enable_trajectory_terminal_bonus", None)
+        terminal_enabled = True if eterm is None else bool(eterm)
+
+        if dense_enabled and not use_next_gt_obs and self.model is not None:
+            raise ValueError(
+                "reward.trajectory.enable_trajectory_dense_milestone=true requires "
+                "trajectory_rollout.gt_use_next_observation=true (dense aligns each step with next-frame GT)."
+            )
+
+        bsz = predicted_micro_actions.shape[0]
+        n_micro = predicted_micro_actions.shape[1]
+        adim = int(predicted_micro_actions.shape[-1])
+        chunk_actions = int(chunk_actions)
+
+        gt_pixels = pil_batch_to_pixels_btc(expert_views_per_traj, self.image_size, self.device)
+        reward_field = predicted_micro_actions.to(self.device)
+        gt_micro_t = gt_micro_actions.to(self.device) if gt_micro_actions is not None else None
+
+        if self.model is not None:
+            from wmrl.workers.lewm_rollout_micro import encode_pixels_bt
+
+            with torch.no_grad():
+                gt_embs_full = encode_pixels_bt(self.model, gt_pixels.float())
+                t_enc = gt_embs_full.shape[1]
+                if use_next_gt_obs:
+                    if t_enc != n_micro + 1:
+                        raise ValueError(
+                            "trajectory_rollout.gt_use_next_observation=true requires expert_views "
+                            f"length n_micro+1={n_micro + 1} per trajectory (got encoder T={t_enc})."
+                        )
+                    gt_embs = gt_embs_full[:, 1 : n_micro + 1, :].contiguous()
+                else:
+                    if t_enc != n_micro:
+                        raise ValueError(
+                            "trajectory_rollout.gt_use_next_observation=false requires expert_views "
+                            f"length n_micro={n_micro} per trajectory (got encoder T={t_enc})."
+                        )
+                    gt_embs = gt_embs_full
+                first_chw = gt_pixels[:, 0].contiguous().float()
+                pred_act_micro = self._match_action_dim(reward_field.float())
+                pred_emb = predict_micro_emb_sequence_open_loop(self.model, first_chw, pred_act_micro, self.history_size)
+                cos_k = F.cosine_similarity(pred_emb, gt_embs, dim=-1).clamp(min=-1.0, max=1.0)
+                term_cos = F.cosine_similarity(pred_emb[:, -1], gt_embs[:, -1], dim=-1).clamp(min=-1.0, max=1.0)
+                pos_k = 0.5 * (cos_k + 1.0)
+        elif self.use_fallback:
+            if gt_micro_t is None or not bool(fallback_pair):
+                cos_k = reward_field[..., 0] * 0.0
+            else:
+                cos_k = F.cosine_similarity(reward_field, gt_micro_t, dim=-1)
+            cos_k = cos_k.clamp(min=-1.0, max=1.0)
+            pos_k = 0.5 * (cos_k + 1.0)
+            term_cos = cos_k[:, -1]
+            pred_emb = None
+            gt_embs = None
+        else:
+            raise RuntimeError(
+                "LEWM model unavailable and trajectory reward requires it (set reward.fallback_to_action_embedding=true for dev)."
+            )
+
+        token_r = torch.zeros(bsz, n_micro, adim, device=self.device, dtype=torch.float32)
+
+        denom_per_chunk_slot = float(max(1, chunk_actions * adim))
+
+        def _credit_ks(scale: float, ks: list[int]) -> None:
+            for kk in ks:
+                cp_k = int(kk // chunk_actions)
+                slice_b = slice(cp_k * chunk_actions, (cp_k + 1) * chunk_actions)
+                if denom_mode == "chunk_tokens":
+                    inc = scale * pos_k[:, kk : kk + 1].unsqueeze(-1).expand(bsz, chunk_actions, adim) / denom_per_chunk_slot
+                elif denom_mode == "unity":
+                    inc = scale * pos_k[:, kk : kk + 1].unsqueeze(-1).expand(bsz, chunk_actions, adim)
+                else:
+                    raise ValueError(f"Unknown reward.trajectory.credit_denom_mode: {denom_mode}")
+                token_r[:, slice_b] += inc
+
+        milestone_ks: list[int] = []
+        if sparse_enabled:
+            if n_micro % chunk_actions != 0:
+                raise ValueError(
+                    f"sparse trajectory milestones require n_micro % chunk_actions == 0; got {n_micro} % {chunk_actions}"
+                )
+            milestone_ks = list(range(chunk_actions - 1, n_micro, chunk_actions))
+            _credit_ks(sparse_ms, milestone_ks)
+
+        if dense_enabled:
+            _credit_ks(dense_ms, list(range(n_micro)))
+
+        succeeded = term_cos >= thresh
+        if terminal_enabled and term_bonus != 0.0:
+            tot_tok = float(max(1, n_micro * adim))
+            token_r += (term_bonus * succeeded.float()).unsqueeze(1).unsqueeze(2) / tot_tok
+
+        if bool(traj_cfg.get("normalize_token_rewards", False)):
+            flat = token_r.reshape(bsz, -1)
+            std = flat.std(dim=1, unbiased=False).clamp_min(1e-6).unsqueeze(1).unsqueeze(2)
+            mean = flat.mean(dim=1).unsqueeze(1).unsqueeze(2)
+            token_r = (token_r - mean) / std
+
+        token_flat = token_r.reshape(bsz, -1).detach().cpu()
+        milestone_mean_raw = float(cos_k.mean().detach().cpu())
+        milestone_std_raw = float(cos_k.std(unbiased=False).detach().cpu())
+
+        sparse_mean_raw = float("nan")
+        if sparse_enabled and milestone_ks:
+            m_idx_t = torch.tensor(milestone_ks, device=cos_k.device, dtype=torch.long)
+            cos_sp = cos_k.index_select(1, m_idx_t)
+            sparse_mean_raw = float(cos_sp.mean().detach().cpu())
+
+        dense_mean_raw = float(cos_k.mean().detach().cpu()) if dense_enabled else float("nan")
+
+        step_mean = float(pos_k.mean().detach().cpu())
+        step_std = float(pos_k.std(unbiased=False).detach().cpu())
+
+        out = {
+            "token_level_rewards": token_flat,
+            "reward_mean": float(token_flat.mean().cpu()),
+            "reward_std": float(token_flat.std(unbiased=False).cpu()),
+            "step_reward_mean": step_mean,
+            "step_reward_std": step_std,
+            "reward_mean_raw": milestone_mean_raw,
+            "reward_std_raw": milestone_std_raw,
+            "step_reward_mean_raw": milestone_mean_raw,
+            "step_reward_std_raw": milestone_std_raw,
+            "reward/terminal_cos_mean": float(term_cos.mean().detach().cpu()),
+            "reward/terminal_success_rate": float(succeeded.float().mean().detach().cpu()),
+            "reward/n_micro_steps": float(n_micro),
+            "reward/s_chunks_approx": float(n_micro / chunk_actions),
+            "reward/sparse_milestone_mean_raw": sparse_mean_raw,
+            "reward/dense_micro_mean_raw": dense_mean_raw,
+        }
+        out["reward/enabled_sparse"] = float(1.0 if sparse_enabled else 0.0)
+        out["reward/enabled_dense"] = float(1.0 if dense_enabled else 0.0)
+        out["reward/enabled_terminal"] = float(1.0 if terminal_enabled else 0.0)
+        return out

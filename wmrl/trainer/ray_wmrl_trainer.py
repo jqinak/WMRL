@@ -22,13 +22,14 @@ except ModuleNotFoundError:
     for _p in _candidates:
         if str(_p) not in os.sys.path:
             os.sys.path.insert(0, str(_p))
-    if "verl" in os.sys.modules:
-        del os.sys.modules["verl"]
+    if "verl" in sys.modules:
+        del sys.modules["verl"]
     core_algos = importlib.import_module("verl.trainer.ppo.core_algos")
 
-
-from wmrl.workers import ActorRolloutWorker, LewmRewardWorker, TokenizerBridge
 from starVLA.dataloader.lerobot_datasets import collate_fn, get_vla_dataset
+
+from wmrl.data.trajectory_rollout_iterable import TrajectoryRolloutIterable
+from wmrl.workers import ActorRolloutWorker, LewmRewardWorker, TokenizerBridge
 
 
 def _flatten_config_for_wandb(cfg) -> dict:
@@ -66,7 +67,10 @@ class RayWMRLTrainer:
         self.bridge = TokenizerBridge()  # 批次桥接器
         self.actor_worker = ActorRolloutWorker(config)  # 策略 worker
         self.reward_worker = LewmRewardWorker(config)  # 奖励 worker
-        self.train_dataloader = self._build_dataloader()  # 训练数据流
+        self.use_trajectory_rollout = bool(OmegaConf.select(config, "trajectory_rollout.enabled") or False)
+        if self.use_trajectory_rollout:
+            _log("[trajectory_rollout] enabled: multi-chunk trajectory + LEWM open-loop rewards")
+        self.rollout_cycle = itertools.cycle(self._build_rollout_stream())
         self.total_steps = int(config.trainer.total_training_steps)  # 总步数
         self.log_interval = int(config.trainer.log_interval)  # 日志间隔
         self.save_interval = int(config.trainer.save_interval)  # 保存间隔
@@ -174,6 +178,29 @@ class RayWMRLTrainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
+    def _build_rollout_stream(self):
+        if self.use_trajectory_rollout:
+            return self._build_trajectory_dataloader()
+        return self._build_dataloader()
+
+    def _build_trajectory_dataloader(self):
+        starvla_cfg = OmegaConf.load(self.config.data.starvla_cfg)
+        _log("[trajectory_rollout] 构建 TrajectoryRolloutIterable ...")
+        base = get_vla_dataset(data_cfg=starvla_cfg.datasets.vla_data)
+        traj_cfg = self.config.trajectory_rollout
+        a = int(self.actor_worker.action_horizon)
+        it_ds = TrajectoryRolloutIterable(
+            base,
+            batch_size=int(self.config.data.train_batch_size),
+            chunk_actions=a,
+            min_chunks=int(traj_cfg.get("min_chunks", 2)),
+            max_chunks=int(traj_cfg.get("max_chunks", 16)),
+            seed=int(self.config.runtime.seed),
+            action_take_dim=int(traj_cfg.get("action_take_dim", self.actor_worker.action_dim)),
+            gt_use_next_observation=bool(traj_cfg.get("gt_use_next_observation", True)),
+        )
+        return DataLoader(it_ds, batch_size=None, num_workers=0, pin_memory=False)
+
     def _build_dataloader(self):
         starvla_cfg = OmegaConf.load(self.config.data.starvla_cfg)
         _log("正在构建数据加载器...")
@@ -273,88 +300,182 @@ class RayWMRLTrainer:
             return advantages, returns
         raise NotImplementedError(f"Unsupported adv estimator: {adv_estimator}")
 
+    def _run_trajectory_training_step(self, traj_batch: list):
+        repeat_n = int(self.config.algorithm.rollout_n)
+        b_sz = len(traj_batch)
+        s_chunks = len(traj_batch[0]["chunk_examples"])
+        a = int(self.actor_worker.action_horizon)
+        d = int(self.actor_worker.action_dim)
+        per = a * d
+        micro_tokens = int(s_chunks * per)
+
+        first_pils = [it["expert_views"][0] for it in traj_batch]
+        expert_nested = [it["expert_views"] for it in traj_batch]
+
+        gt_micro_all = torch.stack(
+            [
+                torch.stack(
+                    [
+                        torch.as_tensor(ex["action"], dtype=torch.float32).cpu()
+                        for ex in traj_batch[bi]["chunk_examples"]
+                    ]
+                )
+                .reshape(s_chunks * a, d)
+                .float()
+                for bi in range(b_sz)
+            ],
+            dim=0,
+        ).cpu()
+
+        roll_cache: list[dict] = []
+
+        last_rew_out: dict = {}
+        for _rn in range(repeat_n):
+            chunk_flat: list[dict] = []
+            for bi in range(b_sz):
+                chunk_flat.extend(traj_batch[bi]["chunk_examples"])
+
+            noise = self.actor_worker.sample_noise_for_chunks(chunk_flat)
+            roll = self.actor_worker.generate_actions_chunk_flat(chunk_flat, noise)
+            pred_c = roll["predicted_actions"]
+            xc = roll["x_chain"]
+
+            reshaped_micro = pred_c.view(b_sz, s_chunks * a, d)
+
+            rew_out = self.reward_worker.compute_trajectory_lewm_rewards(
+                first_pils,
+                expert_nested,
+                reshaped_micro,
+                gt_micro_actions=gt_micro_all.to(self.reward_worker.device),
+                chunk_actions=a,
+            )
+            last_rew_out = rew_out
+            rew_tok_bt = rew_out["token_level_rewards"].detach().cpu().float()
+
+            old_lp = self.actor_worker.compute_log_prob_chunk_flat(chunk_flat, xc).detach().cpu().view(b_sz, s_chunks * per)
+            roll_cache.append({"flat": chunk_flat, "x_chain": xc.detach().cpu(), "rew_rows": rew_tok_bt, "logp_rows": old_lp})
+
+        tokens_rows: list[torch.Tensor] = []
+        logp_rows: list[torch.Tensor] = []
+        flat_chunk_examples_ordered: list[dict] = []
+        chain_slices_ordered: list[torch.Tensor] = []
+
+        for bi in range(b_sz):
+            for rn in range(repeat_n):
+                tokens_rows.append(roll_cache[rn]["rew_rows"][bi])
+                logp_rows.append(roll_cache[rn]["logp_rows"][bi])
+                for j in range(s_chunks):
+                    ci = bi * s_chunks + j
+                    flat_chunk_examples_ordered.append(roll_cache[rn]["flat"][ci])
+                    chain_slices_ordered.append(roll_cache[rn]["x_chain"][ci : ci + 1])
+
+        token_ordered = torch.stack(tokens_rows, dim=0)
+        logprob_ordered = torch.stack(logp_rows, dim=0)
+        chained_chains = torch.cat(chain_slices_ordered, dim=0)
+
+        gid = RayWMRLTrainer._build_group_index(b_sz, repeat_n)
+        self._assert_finite("token_level_rewards", token_ordered)
+        advantages, returns = self._compute_advantage(token_ordered, gid)
+        if advantages.shape != logprob_ordered.shape:
+            raise RuntimeError(f"advantages vs log_probs shape mismatch: {advantages.shape}, {logprob_ordered.shape}")
+
+        min_rs_traj = float(self.config.trainer.get("min_reward_std_trajectory", 0.0))
+        if min_rs_traj > 0.0 and float(token_ordered.std(unbiased=False)) <= min_rs_traj:
+            _log(
+                f"[trajectory] warning: token reward std low {float(token_ordered.std(unbiased=False)):.6e} "
+                f"<= {min_rs_traj:.6e}"
+            )
+
+        update_metrics = self.actor_worker.update_actor_trajectory_chunks(
+            s_chunks=s_chunks,
+            advantages=advantages,
+            flat_chunk_examples=flat_chunk_examples_ordered,
+            chains=chained_chains,
+            old_log_probs=logprob_ordered,
+        )
+
+        rollout_meta = {
+            "predicted_micro_reference": reshaped_micro.detach().cpu(),
+            "micro_tokens": float(micro_tokens),
+            "s_chunks": float(s_chunks),
+            "chunks_total": float(repeat_n * b_sz * s_chunks),
+        }
+        return token_ordered, advantages, returns, chained_chains, logprob_ordered, update_metrics, last_rew_out, rollout_meta
+
     def fit(self):
         if hasattr(sys.stdout, "reconfigure"):
             try:
                 sys.stdout.reconfigure(line_buffering=True)
             except Exception:
                 pass
-        data_iter = itertools.cycle(self.train_dataloader)
+        data_iter = itertools.cycle(self.rollout_cycle)
         try:
             for global_step in range(self.start_step, self.total_steps + 1):
                 raw_batch = next(data_iter)
-                examples = self.bridge.normalize_examples(raw_batch)
-                repeat_n = int(self.config.algorithm.rollout_n)
-                repeated_examples = self._repeat_examples(examples, repeat_n)
 
-                noisy_dict = self.actor_worker.sample_noisy_actions(repeated_examples)
-                rollout = self.actor_worker.generate_actions(repeated_examples, noise=noisy_dict["noise"])
-                old_log_probs = self.actor_worker.compute_log_prob(repeated_examples, rollout["x_chain"])
-                if old_log_probs.shape[0] != len(repeated_examples):
-                    raise RuntimeError(
-                        f"old_log_probs batch mismatch: {old_log_probs.shape[0]} vs {len(repeated_examples)}"
+                if self.use_trajectory_rollout:
+                    traj_batch = raw_batch
+                    if not isinstance(traj_batch, list):
+                        raise TypeError("trajectory dataloader must yield list[dict]")
+                    (
+                        token_level_rewards,
+                        advantages,
+                        returns,
+                        chained_chains,
+                        old_log_probs,
+                        update_metrics,
+                        reward_out,
+                        rollout_aux,
+                    ) = self._run_trajectory_training_step(traj_batch)
+                    repeat_n = int(self.config.algorithm.rollout_n)
+                    if global_step % self.log_interval == 0:
+                        _log(
+                            f"[step {global_step} trajectory] chunks≈{rollout_aux.get('s_chunks', 0)} "
+                            f"n_micro≈{rollout_aux.get('micro_tokens', 0)} "
+                            f"reward_mean={reward_out.get('reward_mean', float('nan')):.4f} "
+                            f"reward/terminal_succ={reward_out.get('reward/terminal_success_rate', 0):.3f} "
+                            f"actor_loss={update_metrics.get('actor/loss', 0):.4f}"
+                        )
+                else:
+                    examples = self.bridge.normalize_examples(raw_batch)
+                    repeat_n = int(self.config.algorithm.rollout_n)
+                    repeated_examples = self._repeat_examples(examples, repeat_n)
+
+                    noisy_dict = self.actor_worker.sample_noisy_actions(repeated_examples)
+                    rollout = self.actor_worker.generate_actions(repeated_examples, noise=noisy_dict["noise"])
+                    old_log_probs = self.actor_worker.compute_log_prob(repeated_examples, rollout["x_chain"])
+                    if old_log_probs.shape[0] != len(repeated_examples):
+                        raise RuntimeError(
+                            f"old_log_probs batch mismatch: {old_log_probs.shape[0]} vs {len(repeated_examples)}"
+                        )
+
+                    reward_out = self.reward_worker.compute_rewards(repeated_examples, rollout["predicted_actions"])
+                    token_level_rewards = reward_out["token_level_rewards"]
+                    self._assert_finite("token_level_rewards", token_level_rewards)
+                    group_index = self._build_group_index(len(examples), repeat_n)
+                    advantages, returns = self._compute_advantage(token_level_rewards, group_index)
+                    if advantages.shape != old_log_probs.shape:
+                        raise RuntimeError(
+                            f"advantages shape {advantages.shape} != old_log_probs shape {old_log_probs.shape}"
+                        )
+
+                    min_reward_std = float(self.config.trainer.get("min_reward_std", 1e-6))
+                    if reward_out["reward_std"] <= min_reward_std:
+                        raise RuntimeError(
+                            f"Reward std too small ({reward_out['reward_std']:.6e}) <= min_reward_std ({min_reward_std:.6e})."
+                        )
+
+                    update_metrics = self.actor_worker.update_actor(
+                        {
+                            "examples": repeated_examples,
+                            "x_chain": rollout["x_chain"],
+                            "old_log_probs": old_log_probs,
+                            "advantages": advantages,
+                        }
                     )
 
-                reward_out = self.reward_worker.compute_rewards(repeated_examples, rollout["predicted_actions"])
-                token_level_rewards = reward_out["token_level_rewards"]
-                self._assert_finite("token_level_rewards", token_level_rewards)
-                group_index = self._build_group_index(len(examples), repeat_n)
-                advantages, returns = self._compute_advantage(token_level_rewards, group_index)
-                if advantages.shape != old_log_probs.shape:
-                    raise RuntimeError(
-                        f"advantages shape {advantages.shape} != old_log_probs shape {old_log_probs.shape}"
-                    )
-
-                min_reward_std = float(self.config.trainer.get("min_reward_std", 1e-6))
-                if reward_out["reward_std"] <= min_reward_std:
-                    raise RuntimeError(
-                        f"Reward std too small ({reward_out['reward_std']:.6e}) <= min_reward_std ({min_reward_std:.6e})."
-                    )
-
-                update_metrics = self.actor_worker.update_actor(
-                    {
-                        "examples": repeated_examples,
-                        "x_chain": rollout["x_chain"],
-                        "old_log_probs": old_log_probs,
-                        "advantages": advantages,
-                    }
-                )
                 for key in ("actor/loss", "actor/ppo_kl", "actor/grad_norm"):
                     self._assert_finite(key, torch.tensor(update_metrics[key]))
-
-                ratio_mean = float(update_metrics.get("actor/ratio_mean", 1.0))
-                smoke = bool(getattr(self.config.runtime, "smoke_random_init", False))
-                # if not smoke and not (0.2 <= ratio_mean <= 5.0):
-                #     raise RuntimeError(f"Suspicious PPO ratio_mean={ratio_mean:.4f}, likely unstable update.")
-
-                if global_step == self.start_step and self.log_interval != 1:
-                    _log(
-                        f"[sanity step {global_step}] "
-                        f"reward_mean={reward_out['reward_mean']:.4f} "
-                        f"reward_mean_raw={reward_out['reward_mean_raw']:.4f} "
-                        f"step_reward_std={reward_out['step_reward_std']:.4f} "
-                        f"actor_loss={update_metrics['actor/loss']:.4f} "
-                        f"ppo_kl={update_metrics['actor/ppo_kl']:.4f} "
-                        f"ratio_mean={update_metrics['actor/ratio_mean']:.4f} "
-                        f"grad_norm={update_metrics['actor/grad_norm']:.4f}"
-                    )
-
-                if global_step % self.log_interval == 0:
-                    _log(
-                        f"[step {global_step}] "
-                        f"reward_mean={reward_out['reward_mean']:.4f} "
-                        f"reward_mean_raw={reward_out['reward_mean_raw']:.4f} "
-                        f"reward_std={reward_out['reward_std']:.4f} "
-                        f"reward_std_raw={reward_out['reward_std_raw']:.4f} "
-                        f"step_reward_mean={reward_out['step_reward_mean']:.4f} "
-                        f"step_reward_mean_raw={reward_out['step_reward_mean_raw']:.4f} "
-                        f"step_reward_std={reward_out['step_reward_std']:.4f} "
-                        f"step_reward_std_raw={reward_out['step_reward_std_raw']:.4f} "
-                        f"actor_loss={update_metrics['actor/loss']:.4f} "
-                        f"ppo_kl={update_metrics['actor/ppo_kl']:.4f} "
-                        f"ratio_mean={update_metrics['actor/ratio_mean']:.4f} "
-                        f"ratio_max={update_metrics['actor/ratio_max']:.4f}"
-                    )
 
                 if global_step % self.save_interval == 0 or global_step == self.total_steps:
                     ckpt = self.actor_worker.save_checkpoint(str(self.output_dir), global_step)
@@ -362,21 +483,29 @@ class RayWMRLTrainer:
 
                 wb: dict[str, float | torch.Tensor] = {}
                 for rk, rv in reward_out.items():
-                    if rk == "token_level_rewards":
+                    if rk == "token_level_rewards" or isinstance(rv, torch.Tensor):
                         continue
-                    wb[f"reward/{rk}"] = rv
+                    try:
+                        wb[str(rk).replace("/", "__")] = float(rv)
+                    except (TypeError, ValueError):
+                        pass
                 wb.update(update_metrics)
                 wb.update(_tensor_scalar_stats(token_level_rewards.float(), "reward/token_level_tensor"))
                 wb.update(_tensor_scalar_stats(advantages.float(), "advantage"))
                 wb.update(_tensor_scalar_stats(returns.float(), "returns"))
-                wb.update(_tensor_scalar_stats(rollout["predicted_actions"].float(), "rollout/predicted_actions"))
                 wb.update(_tensor_scalar_stats(old_log_probs.float(), "rollout/old_log_prob"))
-                pa = rollout["predicted_actions"]
-                wb["meta/base_batch"] = float(len(examples))
-                wb["meta/repeated_batch"] = float(len(repeated_examples))
-                wb["meta/rollout_n"] = float(repeat_n)
-                wb["meta/action_horizon"] = float(pa.shape[1])
-                wb["meta/action_dim"] = float(pa.shape[-1])
+                if self.use_trajectory_rollout:
+                    wb["meta/trajectory_mode"] = 1.0
+                    wb.update({f"meta/{k}": float(v) for k, v in rollout_aux.items() if isinstance(v, (int, float))})
+                    wb["meta/repeated_rollout_trajectories"] = float(repeat_n * len(traj_batch))
+                else:
+                    pa = rollout["predicted_actions"]
+                    wb["meta/base_batch"] = float(len(examples))
+                    wb["meta/repeated_batch"] = float(len(repeated_examples))
+                    wb["meta/rollout_n"] = float(repeat_n)
+                    wb["meta/action_horizon"] = float(pa.shape[1])
+                    wb["meta/action_dim"] = float(pa.shape[-1])
+                    wb.update(_tensor_scalar_stats(pa.float(), "rollout/predicted_actions"))
                 self._wandb_log(global_step, wb)
         finally:
             self._wandb_finish()

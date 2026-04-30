@@ -1,0 +1,31 @@
+LEWM Libero embedding evaluation
+episodes_used: 30
+checkpoint: /project/peilab/qjl/2026/wmrl/playground/wm/embodied_lewm_stage1.ckpt
+
+[full_episode] pred vs encode(last_frame)
+  mse: 2.957977827390035
+  mae: 1.3751241087913513
+  l2: 23.79533437093099
+  cosine_dist: 0.9941229542096456
+
+[n_step_open_loop] mean over (episode, start_t) pairs
+  n=1
+    mse: 0.0025178330596943087
+    mae: 0.03467664423626623
+    l2: 0.6013777114665259
+    cosine_dist: 0.0012895828453521505
+  n=10
+    mse: 0.1031435812547153
+    mae: 0.24727423007538735
+    l2: 4.290994043581006
+    cosine_dist: 0.0500893932402149
+  n=50
+    mse: 2.105218646520672
+    mae: 1.1540061150720928
+    l2: 20.031666071647912
+    cosine_dist: 0.7259333973862773
+  n=100
+    mse: 2.6904158315724165
+    mae: 1.308899786916907
+    l2: 22.688252511350626
+    cosine_dist: 0.9078279945018595

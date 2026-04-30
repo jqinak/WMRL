@@ -2,6 +2,8 @@
 # Libero LEWM 嵌入评测：日志同时输出到终端与文件（tee）
 set -euo pipefail
 
+cd /project/peilab/qjl/2026/wmrl
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -19,7 +21,7 @@ if command -v module >/dev/null 2>&1; then
   module load cuda12.2 2>/dev/null || true
 fi
 
-CKPT="${LEWM_CKPT:-/project/peilab/qjl/2026/wmrl/playground/wm/last.ckpt}"
+CKPT="${LEWM_CKPT:-/project/peilab/qjl/2026/wmrl/playground/wm/embodied_lewm_stage1.ckpt}"
 DATA_ROOT="${LIBERO_ROOT:-/project/peilab/qjl/2026/playground/dataset/libero}"
 
 # 本脚本默认值（可被同名环境变量覆盖）：①+②；任务2 开环只在 n ∈ {1,5,10}

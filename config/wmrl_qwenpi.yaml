@@ -10,8 +10,8 @@ paths:
   # LE-WM：架构 YAML（构建 JEPA 必需）。默认拼 paths.lewm_repo + config/train/lewm.yaml
   lewm_cfg_path: /project/peilab/qjl/2026/wmrl/lewm/config/train/lewm.yaml
   lewm_repo: /project/peilab/qjl/2026/wmrl/lewm
-  starvla_ckpt: /project/peilab/qjl/2026/wmrl/playground/vla/finalmodel/pytorch_model.pt
-  lewm_ckpt: /project/peilab/qjl/2026/wmrl/playground/wm/lewm_weights.ckpt
+  starvla_ckpt: /project/peilab/qjl/2026/wmrl/playground/vla/finalmodel/steps_1000_pytorch_model.pt
+  lewm_ckpt: /project/peilab/qjl/2026/wmrl/playground/wm/embodied_lewm_stage3.ckpt
 
 data:
   dataloader_type: starvla_lerobot
@@ -59,13 +59,42 @@ reward:
   fallback_to_action_embedding: false
   strict_lewm_load: true
   min_param_load_ratio: 0.90
+  # 整条 trajectory rollout 时使用 compute_trajectory_lewm_rewards；terminal_cos_threshold 为原始余弦阈值 [-1,1]
+  trajectory:
+    milestone_scale: 1.0
+    sparse_milestone_scale: 1.0
+    dense_milestone_scale: 1.0
+    terminal_bonus: 0.5
+    terminal_cos_threshold: 0.85
+    credit_denom_mode: chunk_tokens
+    fallback_pair_pred_gt_action: false
+    normalize_token_rewards: false
+    # 三项可独立叠加；也可用 chunk_end_milestone_only 推导旧语义（两处都不配时生效）
+    enable_trajectory_sparse_milestone: true
+    enable_trajectory_dense_milestone: false
+    enable_trajectory_terminal_bonus: true
+    chunk_end_milestone_only: true
+
+# 多 chunk 专家轨迹 rollout：启用后 IterableDataset、s 随机、[min_chunks,max_chunks]，单 worker DataLoader
+trajectory_rollout:
+  enabled: false
+  min_chunks: 2
+  max_chunks: 16
+  action_take_dim: 7
+  # LEWM trajectory 里程碑：pred_emb[k] 与 GT 对齐数据集索引 start+k+1 的帧（默认）；false=start+k（旧）
+  gt_use_next_observation: true
 
 trainer:
   total_training_steps: 200
   auto_resume: true
   min_reward_std: 1e-6
+  # trajectory 模式下仅当 reward std 低于此值打印 warning（0 关闭）
+  min_reward_std_trajectory: 0.0
   log_interval: 10
   save_interval: 100
   output_dir: /project/peilab/qjl/2026/wmrl/checkpoints/wmrl_qwenpi
-  wandb.enabled: true
-  # wandb：默认若 starvla_cfg.trackers 含 wandb 则上报；强制开关或覆盖 entity/project/run_name 见 OmegaConf trainer.wandb（可选）
+  wandb:
+    enabled: true
+    entity: jqinak-hkust
+    project: qwenPI_rl_debug
+  # 仍可被命令行 trainer.wandb.* 覆盖；未启 wandb 时在 starvla_cfg 里读 trackers

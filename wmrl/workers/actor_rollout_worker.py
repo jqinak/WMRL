@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+from PIL import Image as PILImage
 from torch.distributions import Normal
 
 try:
@@ -104,7 +105,13 @@ class ActorRolloutWorker:
         self.optimizer = torch.optim.AdamW(trainable_groups, betas=(0.9, 0.999), weight_decay=0.0)
 
     def _encode_examples(self, examples: list[dict], require_grad: bool) -> EncodedContext:
-        batch_images = [to_pil_preserve(ex["image"]) for ex in examples]
+        batch_images = []
+        for ex in examples:
+            imgs = to_pil_preserve(ex["image"])
+            # Qwen VLM build_qwenvl_inputs 要求每样本为「视角列表」：for img in imgs
+            if isinstance(imgs, PILImage.Image):
+                imgs = [imgs]
+            batch_images.append(imgs)
         instructions = [ex["lang"] for ex in examples]
         autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16) if self.device.type == "cuda" else torch.autocast("cpu", dtype=torch.bfloat16)
         self.model.qwen_vl_interface.eval()
@@ -157,6 +164,12 @@ class ActorRolloutWorker:
         noisy_actions = (1 - t) * noise + t * gt_actions
         flow = gt_actions - noise
         return {"noise": noise.detach().cpu(), "flow": flow.detach().cpu(), "gt_noisy_actions": noisy_actions.detach().cpu(), "gt_timestep_embeddings": t.detach().cpu()}
+
+    def sample_noise_for_chunks(self, chunk_examples_flat: list[dict]) -> torch.Tensor:
+        """Independent Gaussian noises per chunk-row (training-time exploration), shape [N, horizon, dim]."""
+        return torch.randn(
+            len(chunk_examples_flat), self.action_horizon, self.action_dim, dtype=torch.float32
+        ).cpu()
 
     def generate_actions(self, examples: list[dict], noise: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         examples = self.bridge.normalize_examples(examples)
@@ -314,6 +327,111 @@ class ActorRolloutWorker:
         for k in metrics_accum[0].keys():
             out[k] = float(sum(m[k] for m in metrics_accum) / len(metrics_accum))
         return out
+
+    def generate_actions_chunk_flat(self, flat_chunk_examples: list[dict], noise: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self.generate_actions(flat_chunk_examples, noise=noise)
+
+    def update_actor_trajectory_chunks(
+        self,
+        *,
+        s_chunks: int,
+        advantages: torch.Tensor,
+        flat_chunk_examples: list[dict],
+        chains: torch.Tensor,
+        old_log_probs: torch.Tensor,
+    ) -> dict[str, float]:
+        """Sum PPO surrogate over all chunks per trajectory, single backward/step per traj row."""
+        bt = advantages.shape[0]
+        total_chunks = chains.shape[0]
+        if total_chunks != bt * int(s_chunks):
+            raise RuntimeError(f"chunks {total_chunks} != batch {bt} * s_chunks {s_chunks}")
+        if old_log_probs.shape[0] != total_chunks:
+            raise RuntimeError("old_log_probs chunk dim mismatch.")
+        per = int(self.action_horizon * self.action_dim)
+        row_metrics: list[dict[str, float]] = []
+
+        for bi in range(bt):
+            self.optimizer.zero_grad(set_to_none=True)
+            self.action_model.train()
+            self.sigma_net.train()
+            total_loss: torch.Tensor | None = None
+            last_kl = torch.zeros((), device=self.device)
+            last_pg = torch.zeros((), device=self.device)
+
+            for j in range(int(s_chunks)):
+                ci = bi * int(s_chunks) + j
+                single_ex = [flat_chunk_examples[ci]]
+                x_ch = chains[ci : ci + 1].to(self.device)
+                ol = old_log_probs[ci : ci + 1].to(self.device)
+                adv_slice = advantages[bi : bi + 1, j * per : (j + 1) * per].to(self.device)
+
+                new_lp, entropy = self._compute_log_prob(single_ex, x_chain=x_ch, return_entropy=True, require_grad=True)
+                assert entropy is not None
+                log_ratio = (new_lp - ol).float()
+                max_ratio_guard = float(self.config.algorithm.get("max_ratio_guard", 20.0))
+                log_cap = math.log(max_ratio_guard + 1e-12)
+                ratio = torch.exp(torch.clamp(log_ratio, min=-log_cap, max=log_cap))
+                response_mask = torch.ones_like(adv_slice)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=FutureWarning)
+                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = core_algos.compute_policy_loss(
+                        old_log_prob=ol,
+                        log_prob=new_lp,
+                        advantages=adv_slice,
+                        response_mask=response_mask,
+                        cliprange=float(self.config.algorithm.clip_ratio),
+                        cliprange_low=float(self.config.algorithm.clip_ratio),
+                        cliprange_high=float(self.config.algorithm.clip_ratio),
+                        clip_ratio_c=3.0,
+                    )
+                entropy_loss = core_algos.agg_loss(entropy, response_mask, loss_agg_mode="token-mean")
+                chunk_loss = pg_loss - float(self.config.algorithm.entropy_coeff) * entropy_loss
+                if total_loss is None:
+                    total_loss = chunk_loss
+                else:
+                    total_loss = total_loss + chunk_loss
+                last_kl = ppo_kl
+                last_pg = pg_loss
+
+            assert total_loss is not None
+            total_loss.backward()
+            gn = torch.nn.utils.clip_grad_norm_(
+                list(self.action_model.parameters()) + list(self.sigma_net.parameters()),
+                max_norm=float(self.config.algorithm.max_grad_norm),
+            )
+            if not torch.isfinite(total_loss) or not torch.isfinite(gn):
+                raise FloatingPointError("trajectory actor update non-finite loss/grad.")
+
+            target_kl = float(self.config.algorithm.get("target_kl", 0.0))
+            if (
+                bool(self.config.algorithm.get("kl_stop_on_exceed", False))
+                and target_kl > 0.0
+                and float(last_kl) > target_kl
+                and not bool(getattr(self.config.runtime, "smoke_random_init", False))
+            ):
+                raise RuntimeError(f"PPO KL too large: {float(last_kl):.6f} > {target_kl}")
+
+            self.optimizer.step()
+            row_metrics.append(
+                {
+                    "actor/loss": float(total_loss.detach().cpu()),
+                    "actor/pg_loss": float(last_pg.detach().cpu()),
+                    "actor/ppo_kl": float(last_kl.detach().cpu()),
+                    "actor/grad_norm": float(gn.detach().cpu()),
+                    "actor/ratio_mean": 1.0,
+                    "actor/ratio_max": 1.0,
+                    "actor/ratio_raw_max": 1.0,
+                    "actor/pg_clipfrac": 0.0,
+                    "actor/pg_clipfrac_lower": 0.0,
+                    "actor/entropy": float(total_loss.detach().cpu()) * 0.0,
+                }
+            )
+
+        out_metrics: dict[str, float] = {}
+        if row_metrics:
+            for k in row_metrics[0].keys():
+                out_metrics[k] = float(sum(row[k] for row in row_metrics) / len(row_metrics))
+        return out_metrics
 
     def save_checkpoint(self, save_dir: str, step: int) -> str:
         out_dir = Path(save_dir) / f"global_step_{step}"
