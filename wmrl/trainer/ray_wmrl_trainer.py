@@ -301,11 +301,38 @@ class RayWMRLTrainer:
         raise NotImplementedError(f"Unsupported adv estimator: {adv_estimator}")
 
     def _run_trajectory_training_step(self, traj_batch: list):
+        """Trajectory GRPO step: one iterable batch = ``B`` trajectory segments.
+
+        **Data contract (must stay consistent):**
+          - Each ``traj_batch[i]`` has ``chunk_examples`` length ``S`` and ``expert_views``
+            length ``S * a + (1 if gt_use_next_observation else 0)`` (see
+            :class:`wmrl.data.trajectory_rollout_iterable.TrajectoryRolloutIterable`).
+          - Actor rolls out ``pred_c`` shape ``[B*S, a, d]`` then ``reshaped_micro`` is
+            ``[B, S*a, d]`` — same ``S*a`` as GT micro-step pixels (before the optional +1 frame).
+
+        LEWM reward compares open-loop predictor embeddings to GT observation embeddings; pixels
+        are always stacked as **[B, T, C, H, W]** before :meth:`lewm.jepa.JEPA.encode`.
+        """
         repeat_n = int(self.config.algorithm.rollout_n)
         b_sz = len(traj_batch)
         s_chunks = len(traj_batch[0]["chunk_examples"])
         a = int(self.actor_worker.action_horizon)
         d = int(self.actor_worker.action_dim)
+        traj_roll_cfg = OmegaConf.select(self.config, "trajectory_rollout") or OmegaConf.create({})
+        use_next_gt_obs = bool(traj_roll_cfg.get("gt_use_next_observation", True))
+        expect_expert_views = int(s_chunks * a + (1 if use_next_gt_obs else 0))
+
+        for bi, it in enumerate(traj_batch):
+            ev = it.get("expert_views")
+            if ev is None:
+                raise ValueError(f"traj_batch[{bi}] missing key 'expert_views'")
+            if len(ev) != expect_expert_views:
+                raise ValueError(
+                    f"traj_batch[{bi}].expert_views has length {len(ev)}, expected {expect_expert_views} "
+                    f"(s_chunks={s_chunks} * action_horizon={a} + next_frame={int(use_next_gt_obs)}). "
+                    f"meta={it.get('meta')}"
+                )
+
         per = a * d
         micro_tokens = int(s_chunks * per)
 
@@ -352,7 +379,7 @@ class RayWMRLTrainer:
             last_rew_out = rew_out
             rew_tok_bt = rew_out["token_level_rewards"].detach().cpu().float()
 
-            old_lp = self.actor_worker.compute_log_prob_chunk_flat(chunk_flat, xc).detach().cpu().view(b_sz, s_chunks * per)
+            old_lp = self.actor_worker.compute_log_prob(chunk_flat, xc).view(b_sz, s_chunks * per)
             roll_cache.append({"flat": chunk_flat, "x_chain": xc.detach().cpu(), "rew_rows": rew_tok_bt, "logp_rows": old_lp})
 
         tokens_rows: list[torch.Tensor] = []
@@ -373,6 +400,20 @@ class RayWMRLTrainer:
         logprob_ordered = torch.stack(logp_rows, dim=0)
         chained_chains = torch.cat(chain_slices_ordered, dim=0)
 
+        bt_rn = b_sz * repeat_n
+        if logprob_ordered.shape != (bt_rn, s_chunks * per):
+            raise RuntimeError(
+                f"trajectory logprob shape {tuple(logprob_ordered.shape)} != ({bt_rn}, {s_chunks * per}); "
+                "expected one row per (trajectory, rollout_repeat) flattening all chunks."
+            )
+        # ``update_actor_trajectory_chunks`` matches ``_compute_log_prob`` layout: **one row per chunk** × ``per`` tokens.
+        old_log_probs_chunkwise = logprob_ordered.reshape(bt_rn * s_chunks, per)
+        expected_chains = bt_rn * s_chunks
+        if chained_chains.shape[0] != expected_chains:
+            raise RuntimeError(
+                f"x_chain rows {chained_chains.shape[0]} != {expected_chains} (= rollout_rows * s_chunks)."
+            )
+
         gid = RayWMRLTrainer._build_group_index(b_sz, repeat_n)
         self._assert_finite("token_level_rewards", token_ordered)
         advantages, returns = self._compute_advantage(token_ordered, gid)
@@ -391,7 +432,7 @@ class RayWMRLTrainer:
             advantages=advantages,
             flat_chunk_examples=flat_chunk_examples_ordered,
             chains=chained_chains,
-            old_log_probs=logprob_ordered,
+            old_log_probs=old_log_probs_chunkwise,
         )
 
         rollout_meta = {

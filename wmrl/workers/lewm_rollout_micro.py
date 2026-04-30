@@ -7,7 +7,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 from PIL import Image
 
 
@@ -23,14 +22,44 @@ def _pad_time_left(seq: torch.Tensor, target_len: int, pad_pattern: str = "repea
     raise ValueError(f"Unknown pad_pattern: {pad_pattern}")
 
 
+def coerce_pixels_btc_hw(
+    pixels: torch.Tensor,
+    *,
+    batch_b: int,
+    time_t: int,
+) -> torch.Tensor:
+    """Return ``[B, T, C, H, W]`` for :meth:`JEPA.encode`.
+
+    Defense-in-depth: some callers mistakenly materialize pixels as ``[B*T,C,H,W]`` or ``[1,B*T,...]``.
+    """
+    if pixels.ndim == 5:
+        b, t, c, h, w = pixels.shape
+        if b == batch_b and t == time_t:
+            return pixels
+        if b == 1 and t == batch_b * time_t:
+            return pixels.view(batch_b, time_t, c, h, w)
+        if b == batch_b * time_t and t == 1:
+            return pixels.view(batch_b, time_t, c, h, w)
+    elif pixels.ndim == 4:
+        n, c, h, w = pixels.shape
+        if n == batch_b * time_t:
+            return pixels.view(batch_b, time_t, c, h, w)
+    raise ValueError(
+        f"Cannot reshape pixels to [B={batch_b},T={time_t},C,H,W]; got {tuple(pixels.shape)} "
+        "(check expert_views_per_traj nesting: outer batch, inner time steps)."
+    )
+
+
 def encode_pixels_bt(model: Any, pixels_btc_hw: torch.Tensor) -> torch.Tensor:
-    """Encode (B*T) frames → emb (B*T, Din) then rearrange → (B, T, Din)."""
-    b, tm, c, h, w = pixels_btc_hw.shape
-    x = rearrange(pixels_btc_hw.float(), "b t ... -> (b t) ...")
-    raw = {"pixels": x}
-    out = model.encode(raw)
-    emb_flat = out["emb"]
-    return rearrange(emb_flat, "(b t) d -> b t d", b=b)
+    """Encode ``[B, T, C, H, W]`` pixels to ``[B, T, Din]`` via ``model.encode``.
+
+    ``lewm.jepa.JEPA.encode`` expects a 5D tensor and flattens ``(B,T)`` internally; do **not**
+    pre-flatten here or ViT receives a wrong rank (e.g. 3D) and crashes.
+    """
+    if pixels_btc_hw.ndim != 5:
+        raise ValueError(f"encode_pixels_bt expects [B,T,C,H,W], got {pixels_btc_hw.shape}")
+    out = model.encode({"pixels": pixels_btc_hw.float()})
+    return out["emb"]
 
 
 def predict_micro_emb_sequence_open_loop(
@@ -56,7 +85,7 @@ def predict_micro_emb_sequence_open_loop(
     if n_micro < 1:
         raise ValueError("n_micro must be >= 1")
 
-    inp = rearrange(first_frame_chw.unsqueeze(1), "b t c h w -> b t c h w").contiguous()
+    inp = first_frame_chw.unsqueeze(1).contiguous()
     emb0_seq = encode_pixels_bt(model, inp)
     emb0 = emb0_seq[:, 0, :]
     emb_seq = emb0.unsqueeze(1)
@@ -74,24 +103,91 @@ def predict_micro_emb_sequence_open_loop(
     return torch.stack(preds, dim=1)
 
 
+def _torch_or_numpy_to_float_chw_rgb(im_3hwc_or_chw: np.ndarray | torch.Tensor) -> torch.Tensor:
+    """Normalize a single-frame array/tensor to CHW RGB float."""
+    if isinstance(im_3hwc_or_chw, torch.Tensor):
+        t = im_3hwc_or_chw.detach().float().cpu()
+        if t.ndim != 3:
+            raise ValueError(f"Tensor image must be 3D HWC or CHW, got shape {tuple(t.shape)}")
+        a, bdim, cdim = t.shape
+        if a in (1, 3) and a <= min(bdim, cdim):
+            chw = t
+            if a == 1:
+                chw = chw.expand(3, bdim, cdim).clone()
+        elif cdim in (1, 3):
+            chw = t.permute(2, 0, 1).contiguous()
+            if chw.shape[0] == 1:
+                chw = chw.expand(3, chw.shape[1], chw.shape[2]).clone()
+        else:
+            raise ValueError(
+                f"Cannot infer CHW vs HWC for tensor shape {tuple(t.shape)}; "
+                "expected leading or trailing dim in {{1,3}} for RGB/gray."
+            )
+    else:
+        arr = im_3hwc_or_chw
+        if arr.ndim != 3:
+            raise ValueError(f"Expected HWC image, shape={arr.shape}")
+        chw = torch.from_numpy(arr).permute(2, 0, 1).float()
+    return chw
+
+
+def _prep_frame_chw01(im: Any, image_size: int) -> torch.Tensor:
+    """One frame → ``[3, image_size, image_size]`` float in ``[0, 1]``."""
+    if isinstance(im, Image.Image):
+        arr = np.asarray(im.convert("RGB"))
+        chw = torch.from_numpy(arr).permute(2, 0, 1).float()
+    else:
+        chw = _torch_or_numpy_to_float_chw_rgb(im)
+    if float(chw.max()) > 1.0:
+        chw = chw / 255.0
+    return F.interpolate(chw.unsqueeze(0), size=(image_size, image_size), mode="bilinear", align_corners=False).squeeze(
+        0
+    )
+
+
 def pil_batch_to_pixels_btc(
     batches_of_lists: list[list[Any]],
     image_size: int,
     device: torch.device,
     dtype=torch.float32,
+    *,
+    expected_batch: int | None = None,
+    expected_time: int | None = None,
 ) -> torch.Tensor:
-    """batches_of_lists[b][t] PIL or ndarray -> FloatTensor [B, T, C, H, W] in [0,1]."""
-    out = []
+    """``batches_of_lists[b][t]`` frame → tensor ``[B, T, 3, H, W]`` in ``[0, 1]``.
+
+    **Contract:** outer = batch trajectory index (same order as ``predicted_micro_actions``),
+    inner = micro-step time, length ``num_micro_steps`` plus one when using next-frame GT observations.
+    """
+    if not batches_of_lists:
+        raise ValueError("pil_batch_to_pixels_btc: batches_of_lists is empty")
+    out_rows: list[torch.Tensor] = []
     for views in batches_of_lists:
-        chw_rows = []
-        for im in views:
-            arr = np.asarray(im if not isinstance(im, Image.Image) else im.convert("RGB"))
-            if arr.ndim != 3:
-                raise ValueError(f"Expected HWC image, shape={arr.shape}")
-            tchw = torch.from_numpy(arr).permute(2, 0, 1).float()
-            if tchw.max() > 1.0:
-                tchw /= 255.0
-            tchw = F.interpolate(tchw.unsqueeze(0), size=(image_size, image_size), mode="bilinear", align_corners=False)
-            chw_rows.append(tchw.squeeze(0))
-        out.append(torch.stack(chw_rows, dim=0))
-    return torch.stack(out, dim=0).to(device=device, dtype=dtype)
+        if isinstance(views, Image.Image):
+            views_it: Any = [views]
+        elif isinstance(views, np.ndarray) and views.ndim == 3:
+            views_it = [views]
+        elif isinstance(views, torch.Tensor) and views.ndim == 3:
+            views_it = [views]
+        elif isinstance(views, (list, tuple)):
+            views_it = views
+        else:
+            raise TypeError(
+                "Each trajectory must be a list/tuple of frames (or one H×W×C image/tensor). "
+                f"Got {type(views)}."
+            )
+        chw_rows = [_prep_frame_chw01(im, image_size) for im in views_it]
+        out_rows.append(torch.stack(chw_rows, dim=0))
+    stacked = torch.stack(out_rows, dim=0).to(device=device, dtype=dtype)
+    if stacked.ndim != 5:
+        raise ValueError(f"pil_batch_to_pixels_btc: expected 5D [B,T,C,H,W], got {tuple(stacked.shape)}")
+    if expected_batch is not None and stacked.shape[0] != expected_batch:
+        raise ValueError(
+            f"pil_batch_to_pixels_btc: batch dim {stacked.shape[0]} != expected_batch={expected_batch}"
+        )
+    if expected_time is not None and stacked.shape[1] != expected_time:
+        raise ValueError(
+            f"pil_batch_to_pixels_btc: time dim {stacked.shape[1]} != expected_time={expected_time}. "
+            "Check ``trajectory_rollout.gt_use_next_observation`` vs ``len(expert_views)`` per trajectory."
+        )
+    return stacked

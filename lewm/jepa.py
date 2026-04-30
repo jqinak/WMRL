@@ -28,16 +28,25 @@ class JEPA(nn.Module):
 
     def encode(self, info):
         """Encode observations and actions into embeddings.
-        info: dict with pixels and action keys
-        """
 
-        pixels = info['pixels'].float()
-        b = pixels.size(0)
-        pixels = rearrange(pixels, "b t ... -> (b t) ...") # flatten for encoding
-        output = self.encoder(pixels, interpolate_pos_encoding=True)
+        **Contract:** ``info['pixels']`` must be **5D** ``[B, T, C, H, W]``.
+        The ViT encoder consumes ``[B*T, C, H, W]``. A **4D** ``[N, C, H, W]`` tensor
+        must not be passed here: the previous implementation used
+        ``einops.rearrange(..., "b t ... -> (b t) ...")``, which treats dim1 as *time*
+        and turns ``[N, C, H, W]`` into a 3-tensor, breaking ViT.
+        """
+        pixels = info["pixels"].float()
+        if pixels.ndim != 5:
+            raise ValueError(
+                f"JEPA.encode: pixels must be [B, T, C, H, W], got {tuple(pixels.shape)}. "
+                "If you have [B*T, C, H, W], reshape to [B, T, C, H, W] before encode."
+            )
+        b, t, c, h, w = pixels.shape
+        pixels_flat = pixels.reshape(b * t, c, h, w)
+        output = self.encoder(pixels_flat, interpolate_pos_encoding=True)
         pixels_emb = output.last_hidden_state[:, 0]  # cls token
         emb = self.projector(pixels_emb)
-        info["emb"] = rearrange(emb, "(b t) d -> b t d", b=b)
+        info["emb"] = emb.view(b, t, -1)
 
         if "action" in info:
             info["act_emb"] = self.action_encoder(info["action"])

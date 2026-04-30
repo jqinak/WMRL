@@ -11,7 +11,11 @@ from PIL import Image
 
 from lewm import ARPredictor, Embedder, JEPA, MLP
 
-from wmrl.workers.lewm_rollout_micro import pil_batch_to_pixels_btc, predict_micro_emb_sequence_open_loop
+from wmrl.workers.lewm_rollout_micro import (
+    coerce_pixels_btc_hw,
+    pil_batch_to_pixels_btc,
+    predict_micro_emb_sequence_open_loop,
+)
 from wmrl.workers.tokenizer_bridge import TokenizerBridge
 
 
@@ -361,7 +365,16 @@ class LewmRewardWorker:
         adim = int(predicted_micro_actions.shape[-1])
         chunk_actions = int(chunk_actions)
 
-        gt_pixels = pil_batch_to_pixels_btc(expert_views_per_traj, self.image_size, self.device)
+        expect_t = (n_micro + 1) if use_next_gt_obs else n_micro
+
+        gt_pixels = pil_batch_to_pixels_btc(
+            expert_views_per_traj,
+            self.image_size,
+            self.device,
+            expected_batch=bsz,
+            expected_time=expect_t,
+        )
+        gt_pixels = coerce_pixels_btc_hw(gt_pixels, batch_b=bsz, time_t=expect_t)
         reward_field = predicted_micro_actions.to(self.device)
         gt_micro_t = gt_micro_actions.to(self.device) if gt_micro_actions is not None else None
 
