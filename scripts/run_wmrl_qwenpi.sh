@@ -18,7 +18,7 @@ LOG_FILE="${SCRIPT_DIR}/${run_id}_$(date +%Y%m%d_%H%M%S).log"
 : "${WMRL_TRAJ_REWARD_TERMINAL:=true}"
 # wandb 必须用 trainer.wandb.*（根上 wandb_entity 会触发 struct 报错）
 : "${WMRL_WANDB_ENTITY:=jqinak-hkust}"
-: "${WMRL_WANDB_PROJECT:=qwenPI_rl_debug}"
+: "${WMRL_WANDB_PROJECT:=qwenPI_rl_test}"
 
 python3 -u -m main_wmrl_qwenpi \
   trainer.total_training_steps=100 \

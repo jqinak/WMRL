@@ -261,7 +261,8 @@ class ActorRolloutWorker:
                 clip_ratio_c=3.0,
             )
         entropy_loss = core_algos.agg_loss(entropy, response_mask, loss_agg_mode="token-mean")
-        total_loss = pg_loss - float(self.config.algorithm.entropy_coeff) * entropy_loss
+        ec = float(self.config.algorithm.get("entropy_coeff", 0.0))
+        total_loss = pg_loss - ec * entropy_loss
         total_loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             list(self.action_model.parameters()) + list(self.sigma_net.parameters()),
@@ -286,8 +287,11 @@ class ActorRolloutWorker:
         ratio_max = ratio.max()
         return {
             "actor/loss": float(total_loss.detach().cpu()),
+            "actor/loss_avg_per_chunk": float(total_loss.detach().cpu()),
             "actor/pg_loss": float(pg_loss.detach().cpu()),
+            "actor/pg_loss_sum_over_chunks": float(pg_loss.detach().cpu()),
             "actor/entropy": float(entropy_loss.detach().cpu()),
+            "actor/entropy_coeff_times_entropy": float(ec * entropy_loss.detach().cpu()),
             "actor/ppo_kl": float(ppo_kl.detach().cpu()),
             "actor/ratio_mean": float(ratio.mean().detach().cpu()),
             "actor/ratio_max": float(ratio_max.detach().cpu()),
@@ -355,8 +359,15 @@ class ActorRolloutWorker:
             self.action_model.train()
             self.sigma_net.train()
             total_loss: torch.Tensor | None = None
-            last_kl = torch.zeros((), device=self.device)
-            last_pg = torch.zeros((), device=self.device)
+            ec = float(self.config.algorithm.get("entropy_coeff", 0.0))
+            chunk_pg: list[float] = []
+            chunk_entropy_loss: list[float] = []
+            chunk_kl: list[float] = []
+            chunk_clip: list[float] = []
+            chunk_clip_lo: list[float] = []
+            chunk_ratio_mean: list[float] = []
+            chunk_ratio_max: list[float] = []
+            chunk_ratio_raw_max: list[float] = []
 
             for j in range(int(s_chunks)):
                 ci = bi * int(s_chunks) + j
@@ -385,15 +396,28 @@ class ActorRolloutWorker:
                         clip_ratio_c=3.0,
                     )
                 entropy_loss = core_algos.agg_loss(entropy, response_mask, loss_agg_mode="token-mean")
-                chunk_loss = pg_loss - float(self.config.algorithm.entropy_coeff) * entropy_loss
+                chunk_loss = pg_loss - ec * entropy_loss
+                chunk_pg.append(float(pg_loss.detach().cpu()))
+                chunk_entropy_loss.append(float(entropy_loss.detach().cpu()))
+                chunk_kl.append(float(ppo_kl.detach().cpu()))
+                chunk_clip.append(float(pg_clipfrac.detach().cpu()))
+                chunk_clip_lo.append(float(pg_clipfrac_lower.detach().cpu()))
+                chunk_ratio_mean.append(float(ratio.mean().detach().cpu()))
+                chunk_ratio_max.append(float(ratio.max().detach().cpu()))
+                chunk_ratio_raw_max.append(
+                    float(torch.exp(torch.clamp(log_ratio, min=-50.0, max=50.0)).max().detach().cpu())
+                )
+
                 if total_loss is None:
                     total_loss = chunk_loss
                 else:
                     total_loss = total_loss + chunk_loss
-                last_kl = ppo_kl
-                last_pg = pg_loss
 
             assert total_loss is not None
+            n_c = len(chunk_pg)
+            eff_ent = sum(chunk_entropy_loss) / max(1, n_c)
+            eff_pg = sum(chunk_pg) / max(1, n_c)
+
             total_loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(
                 list(self.action_model.parameters()) + list(self.sigma_net.parameters()),
@@ -403,27 +427,32 @@ class ActorRolloutWorker:
                 raise FloatingPointError("trajectory actor update non-finite loss/grad.")
 
             target_kl = float(self.config.algorithm.get("target_kl", 0.0))
+            mean_kl = float(sum(chunk_kl) / max(1, n_c))
             if (
                 bool(self.config.algorithm.get("kl_stop_on_exceed", False))
                 and target_kl > 0.0
-                and float(last_kl) > target_kl
+                and mean_kl > target_kl
                 and not bool(getattr(self.config.runtime, "smoke_random_init", False))
             ):
-                raise RuntimeError(f"PPO KL too large: {float(last_kl):.6f} > {target_kl}")
+                raise RuntimeError(f"PPO KL too large: {mean_kl:.6f} > {target_kl}")
 
             self.optimizer.step()
             row_metrics.append(
                 {
+                    # total_loss = sum_j ( pg_j - ec * entropy_j ) ，与单次 graph 反向一致
                     "actor/loss": float(total_loss.detach().cpu()),
-                    "actor/pg_loss": float(last_pg.detach().cpu()),
-                    "actor/ppo_kl": float(last_kl.detach().cpu()),
+                    "actor/loss_avg_per_chunk": float(total_loss.detach().cpu()) / max(1, n_c),
+                    "actor/pg_loss": eff_pg,
+                    "actor/pg_loss_sum_over_chunks": float(sum(chunk_pg)),
+                    "actor/entropy": eff_ent,
+                    "actor/entropy_coeff_times_entropy": ec * eff_ent,
+                    "actor/ppo_kl": float(sum(chunk_kl) / max(1, n_c)),
+                    "actor/pg_clipfrac": float(sum(chunk_clip) / max(1, n_c)),
+                    "actor/pg_clipfrac_lower": float(sum(chunk_clip_lo) / max(1, n_c)),
+                    "actor/ratio_mean": float(sum(chunk_ratio_mean) / max(1, n_c)),
+                    "actor/ratio_max": float(sum(chunk_ratio_max) / max(1, n_c)),
+                    "actor/ratio_raw_max": max(chunk_ratio_raw_max) if chunk_ratio_raw_max else 0.0,
                     "actor/grad_norm": float(gn.detach().cpu()),
-                    "actor/ratio_mean": 1.0,
-                    "actor/ratio_max": 1.0,
-                    "actor/ratio_raw_max": 1.0,
-                    "actor/pg_clipfrac": 0.0,
-                    "actor/pg_clipfrac_lower": 0.0,
-                    "actor/entropy": float(total_loss.detach().cpu()) * 0.0,
                 }
             )
 

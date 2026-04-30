@@ -421,9 +421,13 @@ class LewmRewardWorker:
 
         token_r = torch.zeros(bsz, n_micro, adim, device=self.device, dtype=torch.float32)
 
+        contrib_s = torch.zeros_like(token_r)
+        contrib_d = torch.zeros_like(token_r)
+        contrib_t = torch.zeros_like(token_r)
+
         denom_per_chunk_slot = float(max(1, chunk_actions * adim))
 
-        def _credit_ks(scale: float, ks: list[int]) -> None:
+        def _credit_into(acc: torch.Tensor, scale: float, ks: list[int]) -> None:
             for kk in ks:
                 cp_k = int(kk // chunk_actions)
                 slice_b = slice(cp_k * chunk_actions, (cp_k + 1) * chunk_actions)
@@ -433,7 +437,7 @@ class LewmRewardWorker:
                     inc = scale * pos_k[:, kk : kk + 1].unsqueeze(-1).expand(bsz, chunk_actions, adim)
                 else:
                     raise ValueError(f"Unknown reward.trajectory.credit_denom_mode: {denom_mode}")
-                token_r[:, slice_b] += inc
+                acc[:, slice_b] += inc
 
         milestone_ks: list[int] = []
         if sparse_enabled:
@@ -442,17 +446,21 @@ class LewmRewardWorker:
                     f"sparse trajectory milestones require n_micro % chunk_actions == 0; got {n_micro} % {chunk_actions}"
                 )
             milestone_ks = list(range(chunk_actions - 1, n_micro, chunk_actions))
-            _credit_ks(sparse_ms, milestone_ks)
+            _credit_into(contrib_s, sparse_ms, milestone_ks)
 
         if dense_enabled:
-            _credit_ks(dense_ms, list(range(n_micro)))
+            _credit_into(contrib_d, dense_ms, list(range(n_micro)))
 
         succeeded = term_cos >= thresh
         if terminal_enabled and term_bonus != 0.0:
             tot_tok = float(max(1, n_micro * adim))
-            token_r += (term_bonus * succeeded.float()).unsqueeze(1).unsqueeze(2) / tot_tok
+            contrib_t += (term_bonus * succeeded.float()).unsqueeze(1).unsqueeze(2) / tot_tok
 
+        token_r = contrib_s + contrib_d + contrib_t
+
+        normalized_token_r = False
         if bool(traj_cfg.get("normalize_token_rewards", False)):
+            normalized_token_r = True
             flat = token_r.reshape(bsz, -1)
             std = flat.std(dim=1, unbiased=False).clamp_min(1e-6).unsqueeze(1).unsqueeze(2)
             mean = flat.mean(dim=1).unsqueeze(1).unsqueeze(2)
@@ -473,6 +481,11 @@ class LewmRewardWorker:
         step_mean = float(pos_k.mean().detach().cpu())
         step_std = float(pos_k.std(unbiased=False).detach().cpu())
 
+        abs_s = float(contrib_s.abs().sum().detach().cpu())
+        abs_d = float(contrib_d.abs().sum().detach().cpu())
+        abs_t = float(contrib_t.abs().sum().detach().cpu())
+        abs_sum = abs_s + abs_d + abs_t + 1e-12
+
         out = {
             "token_level_rewards": token_flat,
             "reward_mean": float(token_flat.mean().cpu()),
@@ -484,11 +497,32 @@ class LewmRewardWorker:
             "step_reward_mean_raw": milestone_mean_raw,
             "step_reward_std_raw": milestone_std_raw,
             "reward/terminal_cos_mean": float(term_cos.mean().detach().cpu()),
+            "reward/terminal_cos_std": float(term_cos.std(unbiased=False).detach().cpu()),
             "reward/terminal_success_rate": float(succeeded.float().mean().detach().cpu()),
             "reward/n_micro_steps": float(n_micro),
             "reward/s_chunks_approx": float(n_micro / chunk_actions),
+            "reward/chunk_actions": float(chunk_actions),
+            "reward/action_dim_tokens": float(adim),
+            "reward/sparse_milestone_count": float(len(milestone_ks)),
             "reward/sparse_milestone_mean_raw": sparse_mean_raw,
             "reward/dense_micro_mean_raw": dense_mean_raw,
+            "reward/contrib_sparse_mean_token": float(contrib_s.mean().detach().cpu()),
+            "reward/contrib_dense_mean_token": float(contrib_d.mean().detach().cpu()),
+            "reward/contrib_terminal_mean_token": float(contrib_t.mean().detach().cpu()),
+            "reward/contrib_sparse_sum_per_traj_mean": float(contrib_s.reshape(bsz, -1).sum(dim=1).mean().detach().cpu()),
+            "reward/contrib_dense_sum_per_traj_mean": float(contrib_d.reshape(bsz, -1).sum(dim=1).mean().detach().cpu()),
+            "reward/contrib_terminal_sum_per_traj_mean": float(contrib_t.reshape(bsz, -1).sum(dim=1).mean().detach().cpu()),
+            "reward/contrib_sparse_abs_mass_share": abs_s / abs_sum,
+            "reward/contrib_dense_abs_mass_share": abs_d / abs_sum,
+            "reward/contrib_terminal_abs_mass_share": abs_t / abs_sum,
+            "reward/scale_sparse_milestone": sparse_ms,
+            "reward/scale_dense_milestone": dense_ms,
+            "reward/scale_terminal_bonus": term_bonus if terminal_enabled else 0.0,
+            "reward/threshold_terminal_cos": thresh,
+            "reward/credit_denom_chunk_tokens": float(denom_per_chunk_slot),
+            "reward/normalize_token_rewards_applied": 1.0 if normalized_token_r else 0.0,
+            "reward/pos_cos_mean": float(pos_k.mean().detach().cpu()),
+            "reward/pos_cos_std": float(pos_k.std(unbiased=False).detach().cpu()),
         }
         out["reward/enabled_sparse"] = float(1.0 if sparse_enabled else 0.0)
         out["reward/enabled_dense"] = float(1.0 if dense_enabled else 0.0)

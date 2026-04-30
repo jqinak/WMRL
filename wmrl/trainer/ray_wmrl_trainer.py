@@ -4,6 +4,7 @@ import copy
 import glob
 import importlib
 import itertools
+import json
 import os
 import random
 import sys
@@ -53,9 +54,189 @@ def _tensor_scalar_stats(t: torch.Tensor, prefix: str) -> dict[str, float]:
     }
 
 
+def _tensor_advanced_stats_rowwise(t: torch.Tensor, prefix: str) -> dict[str, float]:
+    """2D tensor ``[batch, tokens]``: 跨行的 batch 粒度与沿 token 的变化。"""
+    if not isinstance(t, torch.Tensor) or t.ndim != 2:
+        return {}
+    x = t.detach().float()
+    row_mean = x.mean(dim=1)
+    token_mean = x.mean(dim=0)
+    return {
+        f"{prefix}/row_mean/std_across_batch": float(row_mean.std(unbiased=False).cpu()),
+        f"{prefix}/row_sum/mean_across_batch": float(x.sum(dim=1).mean().cpu()),
+        f"{prefix}/row_sum/std_across_batch": float(x.sum(dim=1).std(unbiased=False).cpu()),
+        f"{prefix}/token_mean/std_across_positions": float(token_mean.std(unbiased=False).cpu()),
+    }
+
+
+def _grpo_repeat_dispersion(tlr: torch.Tensor, advantages: torch.Tensor, returns_t: torch.Tensor, b_sz: int, repeat_n: int) -> dict[str, float]:
+    """同一条 trajectory 的不同 rollout_n 副本之间的离散度。"""
+    if repeat_n <= 1 or not isinstance(tlr, torch.Tensor) or tlr.ndim != 2:
+        return {}
+    bt = b_sz * repeat_n
+    if tlr.shape[0] != bt:
+        return {}
+    row_r = tlr.detach().float().mean(dim=1)
+    row_a = advantages.detach().float().mean(dim=1)
+    row_ret = returns_t.detach().float().mean(dim=1)
+    stds_r: list[float] = []
+    stds_a: list[float] = []
+    stds_ret: list[float] = []
+    for bi in range(b_sz):
+        sl = slice(bi * repeat_n, (bi + 1) * repeat_n)
+        stds_r.append(float(row_r[sl].std(unbiased=False).cpu()))
+        stds_a.append(float(row_a[sl].std(unbiased=False).cpu()))
+        stds_ret.append(float(row_ret[sl].std(unbiased=False).cpu()))
+    return {
+        "monitor/grpo_across_repeat/tlr_rowmean_std_mean": float(np.mean(stds_r)),
+        "monitor/grpo_across_repeat/tlr_rowmean_std_max": float(np.max(stds_r)),
+        "monitor/grpo_across_repeat/adv_rowmean_std_mean": float(np.mean(stds_a)),
+        "monitor/grpo_across_repeat/ret_rowmean_std_mean": float(np.mean(stds_ret)),
+    }
+
+
+def _histogram_payload(key: str, tensor: torch.Tensor, max_samples: int = 8192) -> dict:
+    try:
+        import wandb  # type: ignore[import-untyped]
+    except ImportError:
+        return {}
+    x = tensor.detach().float().reshape(-1).cpu().numpy()
+    if x.size == 0:
+        return {}
+    if x.size > max_samples:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(x.size, size=max_samples, replace=False)
+        x = x[idx]
+    return {key: wandb.Histogram(x)}
+
+
+def _build_metrics_glossary_lines(use_trajectory: bool) -> list[str]:
+    lines = [
+        "",
+        "—— WandB / 日志指标说明（细粒度）——",
+        "【公共】rollout/old_log_prob_*：旧策略对采样链的对数概率（flow 各步 Normal 累加），按 token 展平后的统计。",
+        "【公共】advantage/*、returns/*：优势与回报张量（与 token 维对齐）的 mean/std/min/max/absmax。",
+        "【公共】actor/loss：PPO total = sum_chunk(pg − entropy_coef·entropy_agg)；轨迹模式对每 traj 多条 chunk 再对 batch 平均。",
+        "【公共】actor/loss_avg_per_chunk：平均每 chunk 的上述 total（可与 loss 一起看是否多数 chunk）。",
+        "【公共】actor/pg_loss（mean_chunks）：policy surrogate 均值；actor/entropy 为 entropy 聚合；actor/entropy_coeff_times_entropy 为被减项。",
+        "【公共】actor/pg_clipfrac*、ratio_*：重要性采样比及 clip 比例；actor/ppo_kl 近似 KL。",
+    ]
+    if use_trajectory:
+        lines += [
+            "【轨迹】reward/contrib_sparse_*：稀疏里程碑支路写入 token 的贡献（归一化前），mean_token=全 token 均值，sum_per_traj_mean=每条轨迹 token 和再对 batch 平均。",
+            "【轨迹】reward/contrib_dense_*：稠密每步里程碑支路（同上）。",
+            "【轨迹】reward/contrib_terminal_*：终端 bonus 支路（成功轨迹上均匀摊到所有 token）。",
+            "【轨迹】reward/contrib_*_abs_mass_share：三支路绝对值总质量占比（反映放缩后哪一支主导）。",
+            "【轨迹】reward/scale_*：配置中的稀疏/稠密/terminal 系数（terminal 禁用时 scale_terminal_bonus=0）。",
+            "【轨迹】reward/pos_cos_mean：0.5*(cos+1)，LEWM pred vs GT 嵌入余弦映射到 [0,1]。",
+            "【轨迹】reward/sparse_milestone_mean_raw / dense_micro_mean_raw：原始 cos 在对应集合上的平均。",
+            "【轨迹】reward/terminal_success_rate：末步 cos >= terminal_cos_threshold 的比例。",
+            "【轨迹】monitor/grpo_across_repeat/*：同一 base 轨迹的 rollout_n 条副本间，行均值 reward/advantage 的标准差（越大说明随机性越大）。",
+            "【轨迹】meta/*：本步数据形状（s_chunks、micro_tokens、chunks_total、batch 等）。",
+        ]
+    return lines
+
+
+def _format_static_config_report(config, use_trajectory: bool) -> list[str]:
+    algo = OmegaConf.to_container(OmegaConf.select(config, "algorithm") or OmegaConf.create({}), resolve=True)
+    tr = OmegaConf.to_container(OmegaConf.select(config, "trainer") or OmegaConf.create({}), resolve=True)
+    rw = OmegaConf.to_container(OmegaConf.select(config, "reward") or OmegaConf.create({}), resolve=True)
+    data = OmegaConf.to_container(OmegaConf.select(config, "data") or OmegaConf.create({}), resolve=True)
+    runtime = OmegaConf.to_container(OmegaConf.select(config, "runtime") or OmegaConf.create({}), resolve=True)
+    lines = [
+        "=" * 88,
+        "WMRL 训练监控 — 静态参数（本 run 仅报告一次；WandB config 中亦有完整 OmegaConf）",
+        "=" * 88,
+        f"trajectory_rollout.enabled = {use_trajectory}",
+        "--- runtime (摘录) ---",
+        OmegaConf.to_yaml(OmegaConf.create(runtime)).strip(),
+        "--- data (摘录) ---",
+        OmegaConf.to_yaml(OmegaConf.create(data)).strip(),
+        "--- algorithm ---",
+        OmegaConf.to_yaml(OmegaConf.create(algo)).strip(),
+        "--- reward (含 trajectory 三支路与放缩) ---",
+        OmegaConf.to_yaml(OmegaConf.create(rw)).strip(),
+        "--- trainer (摘录，含 log/save/wandb) ---",
+        OmegaConf.to_yaml(OmegaConf.create(tr)).strip(),
+    ]
+    if use_trajectory:
+        tro = OmegaConf.to_container(OmegaConf.select(config, "trajectory_rollout") or OmegaConf.create({}), resolve=True)
+        lines += ["--- trajectory_rollout ---", OmegaConf.to_yaml(OmegaConf.create(tro)).strip()]
+    lines += _build_metrics_glossary_lines(use_trajectory)
+    lines.append("=" * 88)
+    return lines
+
+
 def _log(msg: str) -> None:
     """写到 stdout 并立即刷新；重定向到文件时避免整块缓冲、指标滞后于 stderr 的 Warning。"""
     print(msg, flush=True)
+
+
+def _log_trajectory_dynamic_step(
+    global_step: int,
+    *,
+    b_sz: int,
+    repeat_n: int,
+    reward_out: dict,
+    update_metrics: dict[str, float],
+    rollout_aux: dict,
+    token_stats: dict[str, float],
+    advantage_extra: dict[str, float],
+) -> None:
+    """每步控制台：可变指标一行 + 三路贡献一行（稀疏/稠密/终端）。"""
+    def _gf(d: dict, k: str, default: float = float("nan")) -> float:
+        v = d.get(k, default)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    r = reward_out
+    line1 = (
+        f"[monitor step {global_step} trajectory] "
+        f"B={b_sz} rollout_n={repeat_n} "
+        f"s_chunks={_gf(rollout_aux, 's_chunks'):.1f} n_micro_tokens={_gf(rollout_aux, 'micro_tokens'):.1f} "
+        f"rew_mean={_gf(r, 'reward_mean'):.6f} rew_std={_gf(r, 'reward_std'):.6f} "
+        f"term_succ={_gf(r, 'reward/terminal_success_rate'):.3f} "
+        f"adv_std_across_bt={advantage_extra.get('advantage/row_mean/std_across_batch', float('nan')):.4f}"
+    )
+    line2 = (
+        f"[monitor contrib pre-norm] "
+        f"sparse_mu_tok={_gf(r, 'reward/contrib_sparse_mean_token'):.6f} dense_mu_tok={_gf(r, 'reward/contrib_dense_mean_token'):.6f} "
+        f"term_mu_tok={_gf(r, 'reward/contrib_terminal_mean_token'):.6f} | "
+        f"share|S={_gf(r, 'reward/contrib_sparse_abs_mass_share'):.3f} "
+        f"D={_gf(r, 'reward/contrib_dense_abs_mass_share'):.3f} "
+        f"T={_gf(r, 'reward/contrib_terminal_abs_mass_share'):.3f} | "
+        f"scales(sz/ds/ts)={_gf(r, 'reward/scale_sparse_milestone'):.4f}/{_gf(r, 'reward/scale_dense_milestone'):.4f}/{_gf(r, 'reward/scale_terminal_bonus'):.4f}"
+    )
+    m = update_metrics
+    line3 = (
+        f"[monitor loss] total={m.get('actor/loss', float('nan')):.5f} "
+        f"avg/chunk={m.get('actor/loss_avg_per_chunk', float('nan')):.5f} "
+        f"pg={m.get('actor/pg_loss', float('nan')):.5f} "
+        f"entropy={m.get('actor/entropy', float('nan')):.5f} "
+        f"ent_coef×H={m.get('actor/entropy_coeff_times_entropy', float('nan')):.5f}"
+    )
+    line4 = (
+        f"[monitor policy] kl={m.get('actor/ppo_kl', float('nan')):.5f} "
+        f"clip_hi={m.get('actor/pg_clipfrac', float('nan')):.4f} clip_lo={m.get('actor/pg_clipfrac_lower', float('nan')):.4f} "
+        f"ratio_m={m.get('actor/ratio_mean', float('nan')):.4f} ratio_max={m.get('actor/ratio_max', float('nan')):.4f} "
+        f"ratio_raw_max={m.get('actor/ratio_raw_max', float('nan')):.4f} |grad|={m.get('actor/grad_norm', float('nan')):.5f}"
+    )
+    line5 = (
+        f"[monitor tokens] {_format_short_stats(token_stats)} "
+        f"cos_pos_mean={_gf(r, 'reward/pos_cos_mean'):.5f}"
+    )
+    _log(line1)
+    _log(line2)
+    _log(line3)
+    _log(line4)
+    _log(line5)
+
+
+def _format_short_stats(d: dict[str, float], limit: int = 6) -> str:
+    items = list(d.items())[:limit]
+    return " ".join(f"{k.split('/')[-1]}={v:.4f}" for k, v in items)
 
 
 class RayWMRLTrainer:
@@ -80,6 +261,10 @@ class RayWMRLTrainer:
         if bool(config.trainer.get("auto_resume", False)):
             self.start_step = self._try_resume()
         self._wandb_initialized = False
+        self._monitor_preamble_logged = False
+        self.metrics_jsonl_enabled = bool(config.trainer.get("metrics_jsonl", True))
+        self._metrics_jsonl_fh = None
+        self._metrics_jsonl_path_announced = False
         self._maybe_init_wandb()
 
     def _maybe_init_wandb(self) -> None:
@@ -148,9 +333,12 @@ class RayWMRLTrainer:
             return
         import wandb  # type: ignore[import-untyped]
 
-        out: dict[str, float] = {}
+        out: dict = {}
         for k, v in metrics.items():
             if isinstance(v, torch.Tensor):
+                continue
+            if isinstance(v, wandb.Histogram) or type(v).__name__ == "Histogram":
+                out[str(k)] = v
                 continue
             try:
                 x = float(v)
@@ -160,6 +348,86 @@ class RayWMRLTrainer:
                 pass
         if out:
             wandb.log(out, step=int(global_step))
+
+    def _append_metrics_jsonl(self, global_step: int, wb: dict) -> None:
+        if not self.metrics_jsonl_enabled:
+            return
+        path = self.output_dir / "train_metrics.jsonl"
+        if self._metrics_jsonl_fh is None:
+            self._metrics_jsonl_fh = open(path, "a", encoding="utf-8")
+            if not self._metrics_jsonl_path_announced:
+                _log(f"[metrics] 本地逐标量记录: {path}（ trainer.metrics_jsonl=false 可关闭）")
+                self._metrics_jsonl_path_announced = True
+        row: dict = {"global_step": int(global_step), "trajectory_mode": bool(self.use_trajectory_rollout)}
+        hist_prefixes = ("hist/", "hist__")
+        for k, v in wb.items():
+            sk = str(k)
+            if sk.startswith(hist_prefixes):
+                continue
+            if isinstance(v, torch.Tensor):
+                continue
+            try:
+                import wandb  # type: ignore[import-untyped]
+
+                if isinstance(v, wandb.Histogram) or type(v).__name__ == "Histogram":
+                    continue
+            except Exception:
+                if type(v).__name__ == "Histogram":
+                    continue
+            try:
+                fv = float(v)
+                if np.isfinite(fv):
+                    row[sk.replace("/", "__")] = fv
+            except (TypeError, ValueError):
+                pass
+        assert self._metrics_jsonl_fh is not None
+        self._metrics_jsonl_fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self._metrics_jsonl_fh.flush()
+
+    def _close_metrics_jsonl(self) -> None:
+        if self._metrics_jsonl_fh is not None:
+            try:
+                self._metrics_jsonl_fh.flush()
+                self._metrics_jsonl_fh.close()
+            except Exception:
+                pass
+            self._metrics_jsonl_fh = None
+
+    def _wandb_log_static_summary_once(self) -> None:
+        """静态训练/奖励参数写入 WandB Summary，便于对比多 run。"""
+        if not self._wandb_initialized:
+            return
+        import wandb  # type: ignore[import-untyped]
+
+        if wandb.run is None:
+            return
+        run = wandb.run
+        traj = OmegaConf.select(self.config, "reward.trajectory") or OmegaConf.create({})
+        traj_roll = OmegaConf.select(self.config, "trajectory_rollout") or OmegaConf.create({})
+        es = traj.get("enable_trajectory_sparse_milestone", None)
+        ed = traj.get("enable_trajectory_dense_milestone", None)
+        eterm = traj.get("enable_trajectory_terminal_bonus", None)
+        summary: dict[str, float | str] = {
+            "wmrl_monitor/schema_version": 1.0,
+            "static/trajectory_rollout_enabled": 1.0 if self.use_trajectory_rollout else 0.0,
+            "static/rollout_n": float(self.config.algorithm.rollout_n),
+            "static/train_batch_size": float(self.config.data.train_batch_size),
+            "static/action_horizon": float(self.actor_worker.action_horizon),
+            "static/action_dim": float(self.actor_worker.action_dim),
+            "reward_static/sparse_milestone_scale": float(traj.get("sparse_milestone_scale", traj.get("milestone_scale", 1.0))),
+            "reward_static/dense_milestone_scale": float(traj.get("dense_milestone_scale", traj.get("milestone_scale", 1.0))),
+            "reward_static/terminal_bonus": float(traj.get("terminal_bonus", 0.5)),
+            "reward_static/terminal_cos_threshold": float(traj.get("terminal_cos_threshold", 0.85)),
+            "reward_static/flag_sparse_explicit": -1.0 if es is None else (1.0 if bool(es) else 0.0),
+            "reward_static/flag_dense_explicit": -1.0 if ed is None else (1.0 if bool(ed) else 0.0),
+            "reward_static/flag_terminal_explicit": -1.0 if eterm is None else (1.0 if bool(eterm) else 0.0),
+            "reward_static/chunk_end_milestone_only": 1.0 if bool(traj.get("chunk_end_milestone_only", True)) else 0.0,
+            "reward_static/credit_denom_mode": str(traj.get("credit_denom_mode", "chunk_tokens")),
+            "reward_static/normalize_token_rewards": 1.0 if bool(traj.get("normalize_token_rewards", False)) else 0.0,
+            "reward_static/gt_use_next_observation": 1.0 if bool(traj_roll.get("gt_use_next_observation", True)) else 0.0,
+        }
+        for k, v in summary.items():
+            run.summary[k] = v
 
     def _wandb_finish(self) -> None:
         if not self._wandb_initialized:
@@ -454,6 +722,12 @@ class RayWMRLTrainer:
             for global_step in range(self.start_step, self.total_steps + 1):
                 raw_batch = next(data_iter)
 
+                if global_step == self.start_step and not self._monitor_preamble_logged:
+                    for line in _format_static_config_report(self.config, self.use_trajectory_rollout):
+                        _log(line)
+                    self._wandb_log_static_summary_once()
+                    self._monitor_preamble_logged = True
+
                 if self.use_trajectory_rollout:
                     traj_batch = raw_batch
                     if not isinstance(traj_batch, list):
@@ -469,13 +743,24 @@ class RayWMRLTrainer:
                         rollout_aux,
                     ) = self._run_trajectory_training_step(traj_batch)
                     repeat_n = int(self.config.algorithm.rollout_n)
+                    b_mon = len(traj_batch)
+                    tok_st = _tensor_scalar_stats(token_level_rewards.float(), "reward/token_level_tensor")
+                    adv_ex = _tensor_advanced_stats_rowwise(advantages.float(), "advantage")
+                    _log_trajectory_dynamic_step(
+                        global_step,
+                        b_sz=b_mon,
+                        repeat_n=repeat_n,
+                        reward_out=reward_out,
+                        update_metrics=update_metrics,
+                        rollout_aux=rollout_aux,
+                        token_stats=tok_st,
+                        advantage_extra=adv_ex,
+                    )
                     if global_step % self.log_interval == 0:
                         _log(
-                            f"[step {global_step} trajectory] chunks≈{rollout_aux.get('s_chunks', 0)} "
-                            f"n_micro≈{rollout_aux.get('micro_tokens', 0)} "
-                            f"reward_mean={reward_out.get('reward_mean', float('nan')):.4f} "
-                            f"reward/terminal_succ={reward_out.get('reward/terminal_success_rate', 0):.3f} "
-                            f"actor_loss={update_metrics.get('actor/loss', 0):.4f}"
+                            f"[step {global_step} trajectory recap] chunks≈{float(rollout_aux.get('s_chunks', 0)):.1f} "
+                            f"n_micro≈{float(rollout_aux.get('micro_tokens', 0)):.1f} "
+                            f"(见上方 [monitor step …] 每步完整曲线)"
                         )
                 else:
                     examples = self.bridge.normalize_examples(raw_batch)
@@ -522,7 +807,7 @@ class RayWMRLTrainer:
                     ckpt = self.actor_worker.save_checkpoint(str(self.output_dir), global_step)
                     _log(f"[step {global_step}] saved checkpoint: {ckpt}")
 
-                wb: dict[str, float | torch.Tensor] = {}
+                wb: dict = {}
                 for rk, rv in reward_out.items():
                     if rk == "token_level_rewards" or isinstance(rv, torch.Tensor):
                         continue
@@ -532,13 +817,29 @@ class RayWMRLTrainer:
                         pass
                 wb.update(update_metrics)
                 wb.update(_tensor_scalar_stats(token_level_rewards.float(), "reward/token_level_tensor"))
+                wb.update(_tensor_advanced_stats_rowwise(token_level_rewards.float(), "monitor/tlr"))
                 wb.update(_tensor_scalar_stats(advantages.float(), "advantage"))
+                wb.update(_tensor_advanced_stats_rowwise(advantages.float(), "monitor/adv"))
                 wb.update(_tensor_scalar_stats(returns.float(), "returns"))
+                wb.update(_tensor_advanced_stats_rowwise(returns.float(), "monitor/ret"))
                 wb.update(_tensor_scalar_stats(old_log_probs.float(), "rollout/old_log_prob"))
                 if self.use_trajectory_rollout:
                     wb["meta/trajectory_mode"] = 1.0
                     wb.update({f"meta/{k}": float(v) for k, v in rollout_aux.items() if isinstance(v, (int, float))})
                     wb["meta/repeated_rollout_trajectories"] = float(repeat_n * len(traj_batch))
+                    wb.update(
+                        _grpo_repeat_dispersion(
+                            token_level_rewards,
+                            advantages,
+                            returns,
+                            len(traj_batch),
+                            int(self.config.algorithm.rollout_n),
+                        )
+                    )
+                    if bool(self.config.trainer.get("wandb_histograms", True)):
+                        wb.update(_histogram_payload("hist/token_level_reward", token_level_rewards))
+                        wb.update(_histogram_payload("hist/advantage", advantages))
+                        wb.update(_histogram_payload("hist/returns", returns))
                 else:
                     pa = rollout["predicted_actions"]
                     wb["meta/base_batch"] = float(len(examples))
@@ -547,6 +848,30 @@ class RayWMRLTrainer:
                     wb["meta/action_horizon"] = float(pa.shape[1])
                     wb["meta/action_dim"] = float(pa.shape[-1])
                     wb.update(_tensor_scalar_stats(pa.float(), "rollout/predicted_actions"))
+                    if bool(self.config.trainer.get("wandb_histograms", True)):
+                        wb.update(_histogram_payload("hist/token_level_reward", token_level_rewards))
+                        wb.update(_histogram_payload("hist/advantage", advantages))
+                    _log(
+                        f"[monitor step {global_step} non-trajectory] B={len(examples)} "
+                        f"rew_mean={reward_out.get('reward_mean', float('nan')):.6f} rew_std={reward_out.get('reward_std', float('nan')):.6f}"
+                    )
+                    m = update_metrics
+                    _log(
+                        f"[monitor loss] total={m.get('actor/loss', float('nan')):.5f} "
+                        f"avg/chunk={m.get('actor/loss_avg_per_chunk', float('nan')):.5f} "
+                        f"pg={m.get('actor/pg_loss', float('nan')):.5f} "
+                        f"entropy={m.get('actor/entropy', float('nan')):.5f} "
+                        f"ent_coef×H={m.get('actor/entropy_coeff_times_entropy', float('nan')):.5f}"
+                    )
+                    _log(
+                        f"[monitor policy] kl={m.get('actor/ppo_kl', float('nan')):.5f} "
+                        f"clip_hi={m.get('actor/pg_clipfrac', float('nan')):.4f} clip_lo={m.get('actor/pg_clipfrac_lower', float('nan')):.4f} "
+                        f"ratio_m={m.get('actor/ratio_mean', float('nan')):.4f} ratio_max={m.get('actor/ratio_max', float('nan')):.4f} "
+                        f"ratio_raw_max={m.get('actor/ratio_raw_max', float('nan')):.4f} |grad|={m.get('actor/grad_norm', float('nan')):.5f}"
+                    )
+                wb["trainer/global_step"] = float(global_step)
                 self._wandb_log(global_step, wb)
+                self._append_metrics_jsonl(global_step, wb)
         finally:
+            self._close_metrics_jsonl()
             self._wandb_finish()

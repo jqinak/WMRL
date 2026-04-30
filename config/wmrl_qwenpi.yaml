@@ -91,6 +91,10 @@ trainer:
   # trajectory 模式下仅当 reward std 低于此值打印 warning（0 关闭）
   min_reward_std_trajectory: 0.0
   log_interval: 10
+  # 每步写入 WandB：token/advantage/returns 采样直方图（设为 false 可略减上传量）
+  # 每步将可序列化标量追加到 output_dir/train_metrics.jsonl（便于本地画 loss 曲线）
+  metrics_jsonl: true
+  wandb_histograms: true
   save_interval: 100
   output_dir: /project/peilab/qjl/2026/wmrl/checkpoints/wmrl_qwenpi
   wandb:
