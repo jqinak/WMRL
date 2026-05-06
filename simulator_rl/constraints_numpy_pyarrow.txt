@@ -1,0 +1,4 @@
+# 与 wmrl + verl（numpy<2）及 transformers→sklearn→pyarrow 链兼容的参考 pin。
+# 若在 dgx 上出现 ``numpy.core.multiarray failed to import``，多为 NumPy 2.x 与旧 pyarrow 二进制不匹配。
+numpy>=1.24,<2.0
+pyarrow>=15.0.0

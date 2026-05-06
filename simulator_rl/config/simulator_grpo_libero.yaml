@@ -1,0 +1,55 @@
+runtime:
+  use_ray: false
+  seed: 42
+  device: cuda
+  smoke_random_init: false
+
+paths:
+  starvla_ckpt: /project/peilab/qjl/2026/starVLA/playground/Checkpoints/libero_qwen35_08b_PI_1w/final_model/pytorch_model.pt
+
+data:
+  starvla_cfg: /project/peilab/qjl/2026/wmrl/config/qwen35vlPI_libero.yaml
+
+algorithm:
+  rollout_n: 8
+  num_flow_steps: 8
+  ppo_epochs: 1
+  ppo_mini_batch_size: 0
+  normalize_advantage: false
+  adv_norm_mode: group
+  adv_norm_eps: 1e-6
+  clip_ratio: 0.2
+  target_kl: 0.1
+  kl_stop_on_exceed: false
+  max_ratio_guard: 20.0
+  entropy_coeff: 0.001
+  actor_lr: 1e-6
+  sigma_lr: 1e-5
+  max_grad_norm: 1.0
+  adv_estimator: grpo
+  gamma: 1.0
+  lam: 1.0
+  sigma_net:
+    hidden_dim: 1024
+    num_layers: 4
+    num_heads: 8
+    min_std: 0.02
+    max_std: 0.30
+    dropout: 0.0
+
+# 可选：checkpoint 内 base_vlm 为相对路径时，相对此 StarVLA 仓库根拼接；不配则用环境变量 STARVLA_DIR 或 wmrl/starVLA
+simulator:
+  starvla_repo_root: /project/peilab/qjl/2026/starVLA
+  task_suite_name: libero_goal
+  render_resolution: 256
+  num_steps_wait: 10
+  base_seed: 7
+  action_unnorm_key: franka
+  policy_image_resize: [224, 224]
+
+trainer:
+  total_training_steps: 200
+  log_interval: 1
+  save_interval: 50
+  metrics_jsonl: false
+  output_dir: /project/peilab/qjl/2026/wmrl/checkpoints/simulator_grpo_libero
