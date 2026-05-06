@@ -29,8 +29,40 @@ except ModuleNotFoundError:
 
 from starVLA.dataloader.lerobot_datasets import collate_fn, get_vla_dataset
 
-from wmrl.data.trajectory_rollout_iterable import TrajectoryRolloutIterable
+from wmrl.data.full_trajectory_rollout_iterable import FullExpertTrajectoryIterable
 from wmrl.workers import ActorRolloutWorker, LewmRewardWorker, TokenizerBridge
+
+
+def _chunks_to_micro_tensor(
+    pred_c: torch.Tensor,
+    *,
+    s_chunks: int,
+    chunk_actions: int,
+    n_micro: int,
+) -> torch.Tensor:
+    """``pred_c`` [S, a, d] → first ``n_micro`` rows [n_micro, d] (drop flow padding tail)."""
+    rows: list[torch.Tensor] = []
+    a = int(chunk_actions)
+    for j in range(int(s_chunks)):
+        gs = j * a
+        take = min(a, int(n_micro) - gs)
+        if take > 0:
+            rows.append(pred_c[j, :take].float())
+    if not rows:
+        raise RuntimeError("_chunks_to_micro_tensor: empty micro sequence")
+    return torch.cat(rows, dim=0)
+
+
+def _gt_chunks_to_micro_tensor(traj: dict, *, s_chunks: int, chunk_actions: int, n_micro: int) -> torch.Tensor:
+    rows: list[torch.Tensor] = []
+    a = int(chunk_actions)
+    for j in range(int(s_chunks)):
+        gs = j * a
+        take = min(a, int(n_micro) - gs)
+        if take > 0:
+            act = torch.as_tensor(traj["chunk_examples"][j]["action"], dtype=torch.float32)
+            rows.append(act[:take])
+    return torch.cat(rows, dim=0)
 
 
 def _flatten_config_for_wandb(cfg) -> dict:
@@ -250,7 +282,7 @@ class RayWMRLTrainer:
         self.reward_worker = LewmRewardWorker(config)  # 奖励 worker
         self.use_trajectory_rollout = bool(OmegaConf.select(config, "trajectory_rollout.enabled") or False)
         if self.use_trajectory_rollout:
-            _log("[trajectory_rollout] enabled: multi-chunk trajectory + LEWM open-loop rewards")
+            _log("[trajectory_rollout] enabled: full-episode iterable (batch=1) + LEWM open-loop rewards")
         self.rollout_cycle = itertools.cycle(self._build_rollout_stream())
         self.total_steps = int(config.trainer.total_training_steps)  # 总步数
         self.log_interval = int(config.trainer.log_interval)  # 日志间隔
@@ -411,7 +443,11 @@ class RayWMRLTrainer:
             "wmrl_monitor/schema_version": 1.0,
             "static/trajectory_rollout_enabled": 1.0 if self.use_trajectory_rollout else 0.0,
             "static/rollout_n": float(self.config.algorithm.rollout_n),
-            "static/train_batch_size": float(self.config.data.train_batch_size),
+            "static/train_batch_size": (
+                float(v)
+                if (v := OmegaConf.select(self.config, "trajectory_rollout.train_batch_size")) is not None
+                else float(self.config.data.train_batch_size)
+            ),
             "static/action_horizon": float(self.actor_worker.action_horizon),
             "static/action_dim": float(self.actor_worker.action_dim),
             "reward_static/sparse_milestone_scale": float(traj.get("sparse_milestone_scale", traj.get("milestone_scale", 1.0))),
@@ -453,17 +489,21 @@ class RayWMRLTrainer:
 
     def _build_trajectory_dataloader(self):
         starvla_cfg = OmegaConf.load(self.config.data.starvla_cfg)
-        _log("[trajectory_rollout] 构建 TrajectoryRolloutIterable ...")
+        _log("[trajectory_rollout] 构建 FullExpertTrajectoryIterable (full episode, yield batch=1) ...")
         base = get_vla_dataset(data_cfg=starvla_cfg.datasets.vla_data)
         traj_cfg = self.config.trajectory_rollout
         a = int(self.actor_worker.action_horizon)
-        it_ds = TrajectoryRolloutIterable(
+        tb = int(traj_cfg.get("train_batch_size", 1))
+        if tb != 1:
+            raise ValueError(
+                f"trajectory_rollout.train_batch_size must be 1 for full-episode WMRL (got {tb}). "
+                "Variable-length trajectories are not packed in one tensor."
+            )
+        it_ds = FullExpertTrajectoryIterable(
             base,
-            batch_size=int(self.config.data.train_batch_size),
             chunk_actions=a,
-            min_chunks=int(traj_cfg.get("min_chunks", 2)),
-            max_chunks=int(traj_cfg.get("max_chunks", 16)),
             seed=int(self.config.runtime.seed),
+            max_sample_tries=int(traj_cfg.get("max_sample_tries", 512)),
             action_take_dim=int(traj_cfg.get("action_take_dim", self.actor_worker.action_dim)),
             gt_use_next_observation=bool(traj_cfg.get("gt_use_next_observation", True)),
         )
@@ -514,11 +554,40 @@ class RayWMRLTrainer:
         if not torch.isfinite(value).all():
             raise FloatingPointError(f"{name} contains NaN/Inf.")
 
-    def _normalize_advantages(self, advantages: torch.Tensor, group_index: np.ndarray) -> torch.Tensor:
+    def _normalize_advantages(
+        self,
+        advantages: torch.Tensor,
+        group_index: np.ndarray,
+        response_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if not bool(self.config.algorithm.get("normalize_advantage", True)):
             return advantages
         mode = str(self.config.algorithm.get("adv_norm_mode", "batch")).lower()
         eps = float(self.config.algorithm.get("adv_norm_eps", 1e-6))
+
+        if (
+            response_mask is not None
+            and response_mask.shape == advantages.shape
+            and bool((response_mask < 0.5).any())
+        ):
+            mc = response_mask.sum(dim=-1).clamp(min=1.0)
+            row_agg = (advantages * response_mask).sum(dim=-1) / mc
+            out_s = torch.zeros_like(row_agg)
+            if mode == "batch":
+                mean_b = row_agg.mean()
+                std_b = row_agg.std(unbiased=False)
+                out_s = (row_agg - mean_b) / (std_b + eps)
+            elif mode == "group":
+                for gid in np.unique(group_index):
+                    idx = np.where(group_index == gid)[0]
+                    g = row_agg[idx]
+                    mean = g.mean()
+                    std = g.std(unbiased=False)
+                    out_s[idx] = (g - mean) / (std + eps)
+            else:
+                raise ValueError(f"Unsupported algorithm.adv_norm_mode: {mode}")
+            return out_s.unsqueeze(-1) * response_mask
+
         out = advantages.clone()
         if mode == "batch":
             mean = out.mean()
@@ -534,14 +603,22 @@ class RayWMRLTrainer:
             return out
         raise ValueError(f"Unsupported algorithm.adv_norm_mode: {mode}")
 
-    def _compute_advantage(self, token_level_rewards: torch.Tensor, group_index: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compute_advantage(
+        self,
+        token_level_rewards: torch.Tensor,
+        group_index: np.ndarray,
+        response_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if token_level_rewards.ndim != 2:
             raise ValueError(f"token_level_rewards should be 2D, got {token_level_rewards.shape}")
         if token_level_rewards.shape[0] != group_index.shape[0]:
             raise ValueError(
                 f"Reward batch size {token_level_rewards.shape[0]} != group index size {group_index.shape[0]}"
             )
-        response_mask = torch.ones_like(token_level_rewards)
+        if response_mask is None:
+            response_mask = torch.ones_like(token_level_rewards)
+        if response_mask.shape != token_level_rewards.shape:
+            raise ValueError("response_mask must match token_level_rewards shape")
         adv_estimator = str(self.config.algorithm.adv_estimator).lower()
         if adv_estimator == "grpo":
             advantages, returns = core_algos.compute_grpo_outcome_advantage(
@@ -549,7 +626,7 @@ class RayWMRLTrainer:
                 response_mask=response_mask,
                 index=group_index,
             )
-            advantages = self._normalize_advantages(advantages, group_index)
+            advantages = self._normalize_advantages(advantages, group_index, response_mask=response_mask)
             self._assert_finite("advantages", advantages)
             self._assert_finite("returns", returns)
             return advantages, returns
@@ -562,80 +639,68 @@ class RayWMRLTrainer:
                 gamma=float(self.config.algorithm.gamma),
                 lam=float(self.config.algorithm.lam),
             )
-            advantages = self._normalize_advantages(advantages, group_index)
+            advantages = self._normalize_advantages(advantages, group_index, response_mask=response_mask)
             self._assert_finite("advantages", advantages)
             self._assert_finite("returns", returns)
             return advantages, returns
         raise NotImplementedError(f"Unsupported adv estimator: {adv_estimator}")
 
     def _run_trajectory_training_step(self, traj_batch: list):
-        """Trajectory GRPO step: one iterable batch = ``B`` trajectory segments.
+        """Full-episode trajectory GRPO: ``len(traj_batch)==1``, ``repeat_n`` rollouts.
 
-        **Data contract (must stay consistent):**
-          - Each ``traj_batch[i]`` has ``chunk_examples`` length ``S`` and ``expert_views``
-            length ``S * a + (1 if gt_use_next_observation else 0)`` (see
-            :class:`wmrl.data.trajectory_rollout_iterable.TrajectoryRolloutIterable`).
-          - Actor rolls out ``pred_c`` shape ``[B*S, a, d]`` then ``reshaped_micro`` is
-            ``[B, S*a, d]`` — same ``S*a`` as GT micro-step pixels (before the optional +1 frame).
-
-        LEWM reward compares open-loop predictor embeddings to GT observation embeddings; pixels
-        are always stacked as **[B, T, C, H, W]** before :meth:`lewm.jepa.JEPA.encode`.
+        Contract matches :class:`wmrl.data.full_trajectory_rollout_iterable.FullExpertTrajectoryIterable`:
+          ``chunk_examples`` length ``S``, ``expert_views`` length ``n_micro`` or ``n_micro+1``,
+          ``meta.n_micro`` / ``meta.pad_tail`` for trimming predictions before LEWM.
+        Token tensors are padded to ``S * a * d`` with ``response_mask`` for PPO.
         """
         repeat_n = int(self.config.algorithm.rollout_n)
-        b_sz = len(traj_batch)
-        s_chunks = len(traj_batch[0]["chunk_examples"])
+        if len(traj_batch) != 1:
+            raise ValueError(
+                f"Full-trajectory WMRL expects batch length 1 (got {len(traj_batch)}). "
+                "Use trajectory_rollout.train_batch_size=1."
+            )
+        item = traj_batch[0]
+        meta = item.get("meta") or {}
+        s_chunks = len(item["chunk_examples"])
         a = int(self.actor_worker.action_horizon)
         d = int(self.actor_worker.action_dim)
+        n_micro = int(meta.get("n_micro", meta.get("micro_steps", -1)))
+        if n_micro < 1:
+            raise ValueError(f"Invalid meta.n_micro={meta.get('n_micro')}")
+
         traj_roll_cfg = OmegaConf.select(self.config, "trajectory_rollout") or OmegaConf.create({})
         use_next_gt_obs = bool(traj_roll_cfg.get("gt_use_next_observation", True))
-        expect_expert_views = int(s_chunks * a + (1 if use_next_gt_obs else 0))
-
-        for bi, it in enumerate(traj_batch):
-            ev = it.get("expert_views")
-            if ev is None:
-                raise ValueError(f"traj_batch[{bi}] missing key 'expert_views'")
-            if len(ev) != expect_expert_views:
-                raise ValueError(
-                    f"traj_batch[{bi}].expert_views has length {len(ev)}, expected {expect_expert_views} "
-                    f"(s_chunks={s_chunks} * action_horizon={a} + next_frame={int(use_next_gt_obs)}). "
-                    f"meta={it.get('meta')}"
-                )
+        expect_expert_views = int(n_micro + (1 if use_next_gt_obs else 0))
+        ev = item.get("expert_views")
+        if ev is None:
+            raise ValueError("traj_batch[0] missing expert_views")
+        if len(ev) != expect_expert_views:
+            raise ValueError(
+                f"expert_views length {len(ev)} != expected {expect_expert_views} "
+                f"(n_micro={n_micro}, gt_use_next_observation={use_next_gt_obs}). meta={meta}"
+            )
 
         per = a * d
-        micro_tokens = int(s_chunks * per)
+        padded_tokens = int(s_chunks * per)
 
-        first_pils = [it["expert_views"][0] for it in traj_batch]
-        expert_nested = [it["expert_views"] for it in traj_batch]
+        mic_full = _gt_chunks_to_micro_tensor(item, s_chunks=s_chunks, chunk_actions=a, n_micro=n_micro)
+        gt_micro_all = mic_full.unsqueeze(0).cpu()
 
-        gt_micro_all = torch.stack(
-            [
-                torch.stack(
-                    [
-                        torch.as_tensor(ex["action"], dtype=torch.float32).cpu()
-                        for ex in traj_batch[bi]["chunk_examples"]
-                    ]
-                )
-                .reshape(s_chunks * a, d)
-                .float()
-                for bi in range(b_sz)
-            ],
-            dim=0,
-        ).cpu()
+        first_pils = [item["expert_views"][0]]
+        expert_nested = [item["expert_views"]]
 
         roll_cache: list[dict] = []
-
         last_rew_out: dict = {}
-        for _rn in range(repeat_n):
-            chunk_flat: list[dict] = []
-            for bi in range(b_sz):
-                chunk_flat.extend(traj_batch[bi]["chunk_examples"])
 
+        for _rn in range(repeat_n):
+            chunk_flat = list(item["chunk_examples"])
             noise = self.actor_worker.sample_noise_for_chunks(chunk_flat)
             roll = self.actor_worker.generate_actions_chunk_flat(chunk_flat, noise)
-            pred_c = roll["predicted_actions"]
+            pred_c = roll["predicted_actions"].float()
             xc = roll["x_chain"]
 
-            reshaped_micro = pred_c.view(b_sz, s_chunks * a, d)
+            micro_1d = _chunks_to_micro_tensor(pred_c, s_chunks=s_chunks, chunk_actions=a, n_micro=n_micro)
+            reshaped_micro = micro_1d.unsqueeze(0)
 
             rew_out = self.reward_worker.compute_trajectory_lewm_rewards(
                 first_pils,
@@ -645,36 +710,47 @@ class RayWMRLTrainer:
                 chunk_actions=a,
             )
             last_rew_out = rew_out
-            rew_tok_bt = rew_out["token_level_rewards"].detach().cpu().float()
 
-            old_lp = self.actor_worker.compute_log_prob(chunk_flat, xc).view(b_sz, s_chunks * per)
-            roll_cache.append({"flat": chunk_flat, "x_chain": xc.detach().cpu(), "rew_rows": rew_tok_bt, "logp_rows": old_lp})
+            rew_nm = rew_out["token_level_rewards"].detach().cpu().float()
+            if rew_nm.shape != (1, n_micro * d):
+                raise RuntimeError(f"reward shape {tuple(rew_nm.shape)} != (1, {n_micro * d})")
 
-        tokens_rows: list[torch.Tensor] = []
-        logp_rows: list[torch.Tensor] = []
-        flat_chunk_examples_ordered: list[dict] = []
-        chain_slices_ordered: list[torch.Tensor] = []
+            rew_pad = torch.zeros(1, padded_tokens)
+            rew_pad[0, : n_micro * d] = rew_nm[0]
 
-        for bi in range(b_sz):
-            for rn in range(repeat_n):
-                tokens_rows.append(roll_cache[rn]["rew_rows"][bi])
-                logp_rows.append(roll_cache[rn]["logp_rows"][bi])
-                for j in range(s_chunks):
-                    ci = bi * s_chunks + j
-                    flat_chunk_examples_ordered.append(roll_cache[rn]["flat"][ci])
-                    chain_slices_ordered.append(roll_cache[rn]["x_chain"][ci : ci + 1])
+            old_lp_flat = self.actor_worker.compute_log_prob(chunk_flat, xc).reshape(s_chunks * per)
 
+            roll_cache.append(
+                {
+                    "flat": chunk_flat,
+                    "x_chain": xc.detach().cpu(),
+                    "rew_pad": rew_pad,
+                    "logp_flat": old_lp_flat,
+                }
+            )
+
+        mask_row = torch.zeros(1, padded_tokens)
+        mask_row[0, : n_micro * d] = 1.0
+
+        tokens_rows = [roll_cache[rn]["rew_pad"][0] for rn in range(repeat_n)]
+        logp_rows = [roll_cache[rn]["logp_flat"] for rn in range(repeat_n)]
         token_ordered = torch.stack(tokens_rows, dim=0)
         logprob_ordered = torch.stack(logp_rows, dim=0)
+        response_mask_bt = mask_row.expand(repeat_n, -1).contiguous()
+
+        flat_chunk_examples_ordered: list[dict] = []
+        chain_slices_ordered: list[torch.Tensor] = []
+        for rn in range(repeat_n):
+            for j in range(s_chunks):
+                flat_chunk_examples_ordered.append(roll_cache[rn]["flat"][j])
+                chain_slices_ordered.append(roll_cache[rn]["x_chain"][j : j + 1])
+
         chained_chains = torch.cat(chain_slices_ordered, dim=0)
 
-        bt_rn = b_sz * repeat_n
-        if logprob_ordered.shape != (bt_rn, s_chunks * per):
-            raise RuntimeError(
-                f"trajectory logprob shape {tuple(logprob_ordered.shape)} != ({bt_rn}, {s_chunks * per}); "
-                "expected one row per (trajectory, rollout_repeat) flattening all chunks."
-            )
-        # ``update_actor_trajectory_chunks`` matches ``_compute_log_prob`` layout: **one row per chunk** × ``per`` tokens.
+        bt_rn = repeat_n
+        if logprob_ordered.shape != (bt_rn, padded_tokens):
+            raise RuntimeError(f"logprob shape {tuple(logprob_ordered.shape)} != ({bt_rn}, {padded_tokens})")
+
         old_log_probs_chunkwise = logprob_ordered.reshape(bt_rn * s_chunks, per)
         expected_chains = bt_rn * s_chunks
         if chained_chains.shape[0] != expected_chains:
@@ -682,9 +758,9 @@ class RayWMRLTrainer:
                 f"x_chain rows {chained_chains.shape[0]} != {expected_chains} (= rollout_rows * s_chunks)."
             )
 
-        gid = RayWMRLTrainer._build_group_index(b_sz, repeat_n)
+        gid = RayWMRLTrainer._build_group_index(1, repeat_n)
         self._assert_finite("token_level_rewards", token_ordered)
-        advantages, returns = self._compute_advantage(token_ordered, gid)
+        advantages, returns = self._compute_advantage(token_ordered, gid, response_mask=response_mask_bt)
         if advantages.shape != logprob_ordered.shape:
             raise RuntimeError(f"advantages vs log_probs shape mismatch: {advantages.shape}, {logprob_ordered.shape}")
 
@@ -701,13 +777,17 @@ class RayWMRLTrainer:
             flat_chunk_examples=flat_chunk_examples_ordered,
             chains=chained_chains,
             old_log_probs=old_log_probs_chunkwise,
+            response_mask=response_mask_bt,
         )
 
         rollout_meta = {
             "predicted_micro_reference": reshaped_micro.detach().cpu(),
-            "micro_tokens": float(micro_tokens),
+            "micro_tokens": float(n_micro * d),
+            "padded_response_tokens": float(padded_tokens),
             "s_chunks": float(s_chunks),
-            "chunks_total": float(repeat_n * b_sz * s_chunks),
+            "chunks_total": float(repeat_n * s_chunks),
+            "n_micro": float(n_micro),
+            "pad_tail": float(meta.get("pad_tail", 0)),
         }
         return token_ordered, advantages, returns, chained_chains, logprob_ordered, update_metrics, last_rew_out, rollout_meta
 

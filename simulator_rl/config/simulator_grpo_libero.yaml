@@ -53,3 +53,10 @@ trainer:
   save_interval: 50
   metrics_jsonl: false
   output_dir: /project/peilab/qjl/2026/wmrl/checkpoints/simulator_grpo_libero
+  wandb:
+    enabled: true
+    entity: jqinak-hkust
+    project: simulator_rl_test
+    # run_name: null   # null 则用 output_dir + seed 自动生成
+    # tags: []
+    # notes: ""

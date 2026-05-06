@@ -441,10 +441,6 @@ class LewmRewardWorker:
 
         milestone_ks: list[int] = []
         if sparse_enabled:
-            if n_micro % chunk_actions != 0:
-                raise ValueError(
-                    f"sparse trajectory milestones require n_micro % chunk_actions == 0; got {n_micro} % {chunk_actions}"
-                )
             milestone_ks = list(range(chunk_actions - 1, n_micro, chunk_actions))
             _credit_into(contrib_s, sparse_ms, milestone_ks)
 

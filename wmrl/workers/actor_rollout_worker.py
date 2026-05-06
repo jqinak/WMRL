@@ -343,6 +343,7 @@ class ActorRolloutWorker:
         flat_chunk_examples: list[dict],
         chains: torch.Tensor,
         old_log_probs: torch.Tensor,
+        response_mask: torch.Tensor | None = None,
     ) -> dict[str, float]:
         """Sum PPO surrogate over all chunks per trajectory, single backward/step per traj row."""
         bt = advantages.shape[0]
@@ -353,6 +354,10 @@ class ActorRolloutWorker:
             raise RuntimeError("old_log_probs chunk dim mismatch.")
         per = int(self.action_horizon * self.action_dim)
         row_metrics: list[dict[str, float]] = []
+
+        mask_bt = response_mask
+        if mask_bt is not None and mask_bt.shape != advantages.shape:
+            raise ValueError("response_mask must match advantages shape in trajectory PPO update.")
 
         for bi in range(bt):
             self.optimizer.zero_grad(set_to_none=True)
@@ -376,26 +381,30 @@ class ActorRolloutWorker:
                 ol = old_log_probs[ci : ci + 1].to(self.device)
                 adv_slice = advantages[bi : bi + 1, j * per : (j + 1) * per].to(self.device)
 
+                if mask_bt is not None:
+                    resp_mask_slice = mask_bt[bi : bi + 1, j * per : (j + 1) * per].to(self.device)
+                else:
+                    resp_mask_slice = torch.ones_like(adv_slice)
+
                 new_lp, entropy = self._compute_log_prob(single_ex, x_chain=x_ch, return_entropy=True, require_grad=True)
                 assert entropy is not None
                 log_ratio = (new_lp - ol).float()
                 max_ratio_guard = float(self.config.algorithm.get("max_ratio_guard", 20.0))
                 log_cap = math.log(max_ratio_guard + 1e-12)
                 ratio = torch.exp(torch.clamp(log_ratio, min=-log_cap, max=log_cap))
-                response_mask = torch.ones_like(adv_slice)
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", category=FutureWarning)
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = core_algos.compute_policy_loss(
                         old_log_prob=ol,
                         log_prob=new_lp,
                         advantages=adv_slice,
-                        response_mask=response_mask,
+                        response_mask=resp_mask_slice,
                         cliprange=float(self.config.algorithm.clip_ratio),
                         cliprange_low=float(self.config.algorithm.clip_ratio),
                         cliprange_high=float(self.config.algorithm.clip_ratio),
                         clip_ratio_c=3.0,
                     )
-                entropy_loss = core_algos.agg_loss(entropy, response_mask, loss_agg_mode="token-mean")
+                entropy_loss = core_algos.agg_loss(entropy, resp_mask_slice, loss_agg_mode="token-mean")
                 chunk_loss = pg_loss - ec * entropy_loss
                 chunk_pg.append(float(pg_loss.detach().cpu()))
                 chunk_entropy_loss.append(float(entropy_loss.detach().cpu()))

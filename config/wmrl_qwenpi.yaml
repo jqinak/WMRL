@@ -75,13 +75,15 @@ reward:
     enable_trajectory_terminal_bonus: true
     chunk_end_milestone_only: true
 
-# 多 chunk 专家轨迹 rollout：启用后 IterableDataset、s 随机、[min_chunks,max_chunks]，单 worker DataLoader
+# 轨迹模式：整段专家轨迹（从 t=0 到 T-1），每步 batch=1；rollout_n 为组内重复次数。
+# 使用 FullExpertTrajectoryIterable；尾部不足一个 action_horizon 的 micro 步在 PPO 中 mask 掉。
+# 如需旧版「随机窗口 + min/max_chunks」，请使用 wmrl.data.trajectory_rollout_iterable.TrajectoryRolloutIterable 自建 DataLoader。
 trajectory_rollout:
   enabled: false
-  min_chunks: 2
-  max_chunks: 16
+  train_batch_size: 1
+  max_sample_tries: 512
   action_take_dim: 7
-  # LEWM trajectory 里程碑：pred_emb[k] 与 GT 对齐数据集索引 start+k+1 的帧（默认）；false=start+k（旧）
+  # LEWM trajectory：pred_emb[k] 与 GT 对齐 start+k+1 帧（默认）；false=start+k
   gt_use_next_observation: true
 
 trainer:
